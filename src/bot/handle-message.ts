@@ -1,4 +1,5 @@
 import { registerVoiceConsole } from './voice-console';
+import { randomUUID } from 'node:crypto';
 import { createVoiceService } from '../voice/service';
 import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
 import type { VoiceReply } from '../voice/types';
@@ -195,6 +196,16 @@ import {
 import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
+import { installGroupMenus, refreshGroupEntryCard } from '../project/group-menu';
+import {
+  accessTierOfKey,
+  createGroupControls,
+  GC,
+  resolveRunTier,
+  type GroupControlContext,
+  type GroupControlProjectView,
+  type GroupControlSessionView,
+} from './group-controls';
 import {
   clearSessionTitleJobKey,
   getSession,
@@ -511,6 +522,8 @@ interface ActiveState {
    * is never consumed — incoming messages get a prompt instead of queueing
    * (they'd be dropped silently at the end otherwise). */
   isGoal?: boolean;
+  /** Human-facing objective of the current goal, for the per-user control panel. */
+  goalObjective?: string;
 }
 
 /** Message-reaction lifecycle controller (see {@link runReaction}). */
@@ -784,6 +797,10 @@ export function createOrchestrator(
     if (sessions.has(key)) sessionTouchedAt.set(key, Date.now());
   }
   const active = new Map<string, ActiveState>();
+  /** Options for control-driven synthetic turns, keyed by their synthetic
+   * message id. Keeping them out of handleTurn's parameter list preserves the
+   * private-extension patch signature. */
+  const controlTurnOptions = new Map<string, TurnRunOptions>();
   /** Per-doc serialization for comment runs (see {@link withDocLock}). */
   const docLocks = new Map<string, Promise<void>>();
   /** Comment session → the instructions content its LIVE thread was created/resumed
@@ -1039,6 +1056,14 @@ export function createOrchestrator(
     // Explicit slash COMMANDS above still take priority (clear, leading intent).
     const goalObjective = parseGoalTrigger(text);
 
+    // 群会话控制入口：原生群菜单 会话/操作/帮助 的目标页；/controls 是
+    // 命令兜底，/controls setup 是管理员对本群的显式修复/回填。必须在任何模型
+    // 分发之前处理，且项目/白名单门已在上面通过。
+    if (cmd === 'controls') {
+      await handleControlsCommand(msg, project, text);
+      return;
+    }
+
     // Single-session group: the whole group is one session keyed by chatId. No
     // topics — reply by quoting (引用回复); runs serialize per chatId (active[chatId]).
     // Commands: /settings (群设置) + /model. /resume has no topic list here.
@@ -1196,7 +1221,7 @@ export function createOrchestrator(
   };
 
   /** Parse a leading slash command; null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | null {
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | 'controls' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
     return name === 'resume' ||
@@ -1205,7 +1230,8 @@ export function createOrchestrator(
       name === 'help' ||
       name === 'compact' ||
       name === 'context' ||
-      name === 'clear'
+      name === 'clear' ||
+      name === 'controls'
       ? name
       : null;
   }
@@ -1257,6 +1283,16 @@ export function createOrchestrator(
    * it so a guest never shares the admin thread (sandbox + codex history). */
   type TurnPerm = { mode?: PermissionMode; network?: boolean; autoCompact?: boolean; roleSuffix?: 'admin' | 'guest' };
 
+  /** Optional strictness for synthetic/control-driven turns. */
+  interface TurnRunOptions {
+    /** Refuse to queue behind an existing run/session task. */
+    requireIdle?: boolean;
+    /** Suppress the ⏳/🫳 receipt reactions when the source id is synthetic. */
+    suppressReceipt?: boolean;
+    /** Abort rather than resume/recreate if the persisted mapping changed. */
+    expectedSession?: { sessionId: string; backend: string; cwd: string };
+  }
+
   /** Pick this sender's tier (admin vs guest) for `project`. */
   function turnPerm(project: Project | undefined, senderId: string): TurnPerm {
     if (!project) return {};
@@ -1273,6 +1309,135 @@ export function createOrchestrator(
   ): { sessionKey: string } & TurnPerm {
     const perm = turnPerm(project, senderId);
     return { sessionKey: perm.roleSuffix ? `${baseKey}#${perm.roleSuffix}` : baseKey, ...perm };
+  }
+
+  // ── 群控制面板：服务端投影（回调载荷永远不携带目标会话字段）──────────
+  function groupPermissionSignature(project: Project): string {
+    return JSON.stringify([
+      project.mode ?? 'full',
+      project.guestMode ?? null,
+      project.network ?? false,
+      project.backend ?? DEFAULT_BACKEND_ID,
+      project.cwd,
+      project.kind ?? 'multi',
+      project.origin ?? 'created',
+    ]);
+  }
+
+  function groupProjectView(project: Project): GroupControlProjectView {
+    return {
+      name: project.name,
+      chatId: project.chatId,
+      kind: (project.kind ?? 'multi') === 'single' ? 'single' : 'multi',
+      backendName: backendDisplayName(project.backend),
+      goalSupported: goalCapable(project),
+      permissionSignature: groupPermissionSignature(project),
+      ...(project.allowedUsers ? { allowedUsers: project.allowedUsers } : {}),
+    };
+  }
+
+  function groupSessionView(rec: SessionRecord): GroupControlSessionView {
+    const state = active.get(rec.threadId);
+    const status = !state ? 'idle' : state.isGoal ? 'goal-running' : 'running';
+    return {
+      key: rec.threadId,
+      title: rec.summary?.trim() || `话题 ${rec.threadId.slice(-6)}`,
+      status,
+      accessTier: accessTierOfKey(rec.threadId),
+      backendName: backendDisplayName(rec.backend),
+      goalSupported: backendFor(rec.backend).capabilities?.goal ?? true,
+      settingsSupported: false,
+      ...(state?.isGoal && state.goalObjective ? { goalObjective: state.goalObjective } : {}),
+      sessionId: rec.sessionId,
+      backend: rec.backend,
+      cwd: rec.cwd,
+      ...(state ? { runToken: state, ...(state.requesterOpenId ? { runOwnerOpenId: state.requesterOpenId } : {}) } : {}),
+    };
+  }
+
+  /** Tier ownership is enforced where the data is read: a non-admin never sees
+   * an `#admin` session in the list, and cannot fetch one by key. */
+  function canOperateTier(sessionKey: string, operatorOpenId: string): boolean {
+    return accessTierOfKey(sessionKey) !== 'admin' || isAdmin(cfg, operatorOpenId);
+  }
+
+  async function listGroupSessionViews(
+    project: GroupControlProjectView,
+    operatorOpenId: string,
+  ): Promise<GroupControlSessionView[]> {
+    const records = (await listSessions())
+      .filter((rec) => rec.chatId === project.chatId)
+      .filter((rec) => canOperateTier(rec.threadId, operatorOpenId))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    return records.map(groupSessionView);
+  }
+
+  async function getGroupSessionView(
+    project: GroupControlProjectView,
+    key: string,
+    operatorOpenId: string,
+  ): Promise<GroupControlSessionView | undefined> {
+    if (!canOperateTier(key, operatorOpenId)) return undefined;
+    const rec = await getSession(key);
+    if (!rec || rec.chatId !== project.chatId) return undefined;
+    return groupSessionView(rec);
+  }
+
+  /** Rejections for cross-tier control actions; never silently retier a run. */
+  function controlTierError(sessionKey: string, operatorOpenId: string): string | undefined {
+    if (accessTierOfKey(sessionKey) === 'admin' && !isAdmin(cfg, operatorOpenId)) {
+      return '⛔ 管理员会话仅限管理员操作。';
+    }
+    return undefined;
+  }
+
+  /**
+   * Tier for the exact selected session key. An explicit `#admin`/`#guest` key
+   * pins the target's scope; the operator's own tier can only DEMOTE (an admin
+   * running a #guest session keeps the guest sandbox) and can never elevate a
+   * guest onto an #admin session — cross-tier access is rejected upstream by
+   * {@link controlTierError}. A legacy unsuffixed key keeps the caller's role,
+   * exactly like ordinary topic routing.
+   */
+  function groupTurnPerm(project: Project, sessionKey: string, operatorOpenId: string): TurnPerm {
+    const runRole = resolveRunTier(accessTierOfKey(sessionKey), isAdmin(cfg, operatorOpenId));
+    const tier = turnTier(project, runRole === 'admin');
+    return { mode: tier.mode, network: project.network, autoCompact: project.autoCompact };
+  }
+
+  function syntheticControlMessage(input: {
+    chatId: string;
+    sessionKey: string;
+    flat: boolean;
+    operatorOpenId: string;
+    text: string;
+    kind: 'continue' | 'goal';
+  }): NormalizedMessage {
+    return {
+      messageId: `gc-${input.kind}-${randomUUID()}`,
+      chatId: input.chatId,
+      chatType: 'group',
+      senderId: input.operatorOpenId,
+      content: input.text,
+      rawContentType: 'text',
+      resources: [],
+      mentions: [],
+      mentionAll: false,
+      mentionedBot: true,
+      threadId: input.flat ? undefined : input.sessionKey.replace(/#(admin|guest)$/, ''),
+      createTime: Date.now(),
+    };
+  }
+
+  async function reloadProjectForControl(
+    project: GroupControlProjectView,
+  ): Promise<Project | { failure: string }> {
+    const latest = await getProjectByChatId(project.chatId);
+    if (!latest) return { failure: '本群未绑定项目。' };
+    if (groupPermissionSignature(latest) !== project.permissionSignature) {
+      return { failure: '项目权限或运行配置已变化，请刷新面板后重试。' };
+    }
+    return latest;
   }
 
   /**
@@ -1323,13 +1488,21 @@ export function createOrchestrator(
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
   function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+    const opts = controlTurnOptions.get(msg.messageId);
+    if (opts) controlTurnOptions.delete(msg.messageId);
     const owner = active.get(sessionKey);
     return orderTurns(sessionKey, async () => {
       if (owner?.intakeCancelled) {
         await channel.send(msg.chatId, { markdown: '排队期间会话已停止，请重发本条消息。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
         return;
       }
-      await prepareTurn(msg, text, sessionKey, flat, project, perm);
+      if (opts?.requireIdle && active.get(sessionKey)) {
+        await channel
+          .send(msg.chatId, { markdown: '⚠️ 所选会话正在运行或排队，未发送「继续」。' }, { replyTo: msg.messageId, replyInThread: !flat })
+          .catch(() => undefined);
+        return;
+      }
+      await prepareTurn(msg, text, sessionKey, flat, project, perm, opts);
     });
   }
 
@@ -1340,10 +1513,17 @@ export function createOrchestrator(
     flat: boolean,
     project: Project | undefined,
     perm: TurnPerm,
+    opts?: TurnRunOptions,
   ): Promise<void> {
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
     if (existing) {
+      if (opts?.requireIdle) {
+        await channel
+          .send(msg.chatId, { markdown: '⚠️ 所选会话正在运行或排队，未发送「继续」。' }, { replyTo: msg.messageId, replyInThread: !flat })
+          .catch(() => undefined);
+        return;
+      }
       // 🎯 goal 会话不接外部输入（turns 由 codex 自续，queue 永远不被消费），
       // 入队只会在收尾被静默丢弃 —— 直接告知而不是黑洞。
       if (existing.isGoal) {
@@ -1366,7 +1546,13 @@ export function createOrchestrator(
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
+        if (opts?.requireIdle) {
+          await channel
+            .send(msg.chatId, { markdown: '⚠️ 所选会话状态已变化，请刷新面板后重试。' }, { replyTo: msg.messageId, replyInThread: !flat })
+            .catch(() => undefined);
+          return;
+        }
+        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text, undefined, opts);
         return;
       }
       // A goal may have started while media downloaded — same prompt as above.
@@ -1379,7 +1565,7 @@ export function createOrchestrator(
       return;
     }
 
-    startReservedRun(msg, text, sessionKey, flat, project, perm);
+    startReservedRun(msg, text, sessionKey, flat, project, perm, undefined, undefined, undefined, undefined, opts);
   }
 
   // Keep preparation ordered, but do not pin the lane on an uncertain steer ACK.
@@ -1455,6 +1641,7 @@ export function createOrchestrator(
     preIngested?: IngestedContext,
     summaryText?: string,
     goal?: boolean,
+    runOpts?: TurnRunOptions,
   ): void {
     // A goal title is the already-extracted objective. Ordinary turns retain
     // the SDK content type so merge-forward/media envelopes can be decoded
@@ -1464,6 +1651,12 @@ export function createOrchestrator(
       : sessionTitleSourceFromMessage(msg, summaryText ?? text);
     const existing = active.get(sessionKey);
     if (existing) {
+      if (runOpts?.requireIdle) {
+        void channel
+          .send(msg.chatId, { markdown: '⚠️ 所选会话正在运行或排队，未发送「继续」。' }, { replyTo: msg.messageId, replyInThread: !flat })
+          .catch(() => undefined);
+        return;
+      }
       // A goal can't co-run with (or queue behind) a turn on the same session —
       // it's an autonomous multi-turn run, not a follow-up. Tell the user and skip.
       if (goal) {
@@ -1492,12 +1685,17 @@ export function createOrchestrator(
       log.info('intake', 'queued', { depth: existing.queue.length });
       return;
     }
-    const reserved: ActiveState = { queue: [], requesterOpenId: msg.senderId, isGoal: goal };
+    const reserved: ActiveState = {
+      queue: [],
+      requesterOpenId: msg.senderId,
+      isGoal: goal,
+      ...(goal ? { goalObjective: text } : {}),
+    };
     active.set(sessionKey, reserved);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       // Goal runs use the OKR reaction (added at dispatch) as their only receipt,
       // not the ⏳/🫳 run-reaction lifecycle.
-      const reaction = goal ? undefined : runReaction(msg.messageId, !sema.hasFree());
+      const reaction = goal || runOpts?.suppressReceipt ? undefined : runReaction(msg.messageId, !sema.hasFree());
       try {
         const tIntake = Date.now();
         // ── 入站三路并行（M-1）── 飞书 API（图片下载 / 文件+引用织入）、本地
@@ -1517,11 +1715,16 @@ export function createOrchestrator(
         // preIngested (handleTurn already wove them into `text`).
         const ingestP = preIngested ? Promise.resolve(preIngested) : ingestContext(msg, text);
         let tResolveDone = tIntake;
-        const resolveP = resolveThread(sessionKey, msg.chatId, {
-          mode: perm.mode,
-          network: perm.network,
-          autoCompact: perm.autoCompact,
-        }).then((r) => {
+        const resolveP = resolveThread(
+          sessionKey,
+          msg.chatId,
+          {
+            mode: perm.mode,
+            network: perm.network,
+            autoCompact: perm.autoCompact,
+          },
+          Boolean(runOpts?.expectedSession),
+        ).then((r) => {
           tResolveDone = Date.now();
           return r;
         });
@@ -1549,6 +1752,34 @@ export function createOrchestrator(
           priorP,
           historyP,
         ]);
+        // Exact-session guard for control-card actions: the controller already
+        // re-read the mapping, but resolveThread runs concurrently and may have
+        // resumed/recreated something else. Fail closed before any turn start.
+        if (runOpts?.expectedSession) {
+          const expected = runOpts.expectedSession;
+          if (
+            !prior ||
+            prior.sessionId !== expected.sessionId ||
+            prior.backend !== expected.backend ||
+            prior.cwd !== expected.cwd
+          ) {
+            if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+            reaction?.done();
+            if (resolved) {
+              if (sessions.get(sessionKey) === resolved) sessions.delete(sessionKey);
+              void resolved.close().catch(() => undefined);
+            }
+            log.info('intake', 'control-session-changed', { sessionKey });
+            await channel
+              .send(
+                msg.chatId,
+                { markdown: '⚠️ 会话映射已变化，未发送本次控制操作。请刷新面板后重试。' },
+                { replyTo: msg.messageId, replyInThread: !flat },
+              )
+              .catch(() => undefined);
+            return;
+          }
+        }
         let firstText = ingested.text;
         let thread = resolved;
         let titleJobKey: string | undefined;
@@ -1718,6 +1949,7 @@ export function createOrchestrator(
     threadId: string,
     chatId: string,
     perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
+    strictSession = false,
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
@@ -1753,6 +1985,12 @@ export function createOrchestrator(
       return { thread: resumed, recreated: false };
     } catch (err) {
       log.fail('agent', err, { phase: 'resume-on-turn', threadId });
+      if (strictSession) {
+        // A card action targets one exact mapping. Silently replacing it with a
+        // fresh native session would violate that contract (and persist the new
+        // id before the caller can object), so fail closed instead.
+        throw new Error('所选会话恢复失败，未执行本次控制操作。请刷新面板后重试。');
+      }
       const cwd = project?.cwd ?? rec.cwd ?? fallbackCwd;
       const fresh = await be.startThread({
         cwd,
@@ -2219,6 +2457,53 @@ export function createOrchestrator(
     });
   }
 
+  /** `/controls` (fresh per-user selector) and `/controls setup` (admin-only
+   * repair/backfill of this group's native menus). Handled before model dispatch. */
+  async function handleControlsCommand(msg: NormalizedMessage, project: Project, text: string): Promise<void> {
+    const setup = /^\/controls\s+setup\b/i.test(text);
+    if (setup) {
+      if (!isAdmin(cfg, msg.senderId)) {
+        await channel
+          .send(msg.chatId, { markdown: '⚠️ `/controls setup` 仅 bot 管理员可用。' }, { replyTo: msg.messageId })
+          .catch(() => undefined);
+        log.info('intake', 'cmd-denied', { cmd: 'controls-setup' });
+        return;
+      }
+      try {
+        const result = await installGroupMenus(channel, project, { allowJoined: true, force: true });
+        const detail = result.reason ? `\n原因：${result.reason}` : '';
+        const headline =
+          result.status === 'installed'
+            ? '✅ 群菜单已安装/修复（会话 / 操作 / 帮助）。'
+            : result.status === 'conflict'
+              ? '⚠️ 群菜单未改动：一级菜单槽位不足或存在非本桥接的菜单。'
+              : result.status === 'skipped'
+                ? 'ℹ️ 已跳过安装。'
+                : '⚠️ 群菜单未完全安装，仍可使用 /controls。';
+        await channel
+          .send(msg.chatId, { text: `${headline}${detail}` }, { replyTo: msg.messageId, replyInThread: Boolean(msg.threadId) })
+          .catch(() => undefined);
+        log.info('card', 'group-menu-setup', { status: result.status, chatId: msg.chatId.slice(-6) });
+      } catch (err) {
+        log.fail('card', err, { phase: 'group-menu-setup' });
+        await channel
+          .send(
+            msg.chatId,
+            { text: '⚠️ 群菜单安装失败，仍可使用 /controls。' },
+            { replyTo: msg.messageId, replyInThread: Boolean(msg.threadId) },
+          )
+          .catch(() => undefined);
+      }
+      return;
+    }
+    await groupControls.openSessions({
+      chatId: msg.chatId,
+      operatorOpenId: msg.senderId,
+      sourceMessageId: msg.messageId,
+      inThread: Boolean(msg.threadId),
+    });
+  }
+
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
   const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
@@ -2381,6 +2666,223 @@ export function createOrchestrator(
     const op = evt.operator?.openId ?? '';
     return op === ownerOpenId || isAdmin(cfg, op);
   };
+
+  // ── 群会话控制面板（原生群菜单 会话/操作/帮助 的目标）─────────
+  // 所有目标元数据都从服务端持久化会话 + 当前 active 状态重新读取；回调只带
+  // 一次性 opaque token。continue 复用原始话题的 handleTurn 路径，绝不新建话题。
+  const groupControls = createGroupControls({
+    isChatAllowed: (chatId) => isChatAllowed(cfg, chatId),
+    isUserAllowedInProject: (project, userId) => isUserAllowedInProject(cfg, project, userId),
+    isAdmin: (userId) => isAdmin(cfg, userId),
+    isAccountTransitioning,
+    getProject: async (chatId) => {
+      const project = await getProjectByChatId(chatId);
+      return project ? groupProjectView(project) : undefined;
+    },
+    listSessions: listGroupSessionViews,
+    getSession: getGroupSessionView,
+    sendCard: async (chatId, card, replyTo, inThread) => {
+      try {
+        await sendManagedCard(channel, chatId, card, replyTo, Boolean(inThread));
+      } catch (err) {
+        log.fail('card', err, { phase: 'group-control-card' });
+        // Static entry/panel cards still work as plain interactive messages when
+        // CardKit is unavailable; callbacks route by action id either way.
+        await channel.send(chatId, { card }, replyTo ? { replyTo, replyInThread: Boolean(inThread) } : undefined);
+      }
+    },
+    sendText: async (chatId, text, replyTo, inThread) => {
+      await channel.send(chatId, { markdown: text }, replyTo ? { replyTo, replyInThread: Boolean(inThread) } : undefined);
+    },
+    continueSession: async ({ project, session, operatorOpenId }) => {
+      const latest = await reloadProjectForControl(project);
+      if ('failure' in latest) return { status: 'stale', message: `⚠️ ${latest.failure}` };
+      // Final tier gate immediately before reservation: a demoted operator (or a
+      // forged picker for an #admin key) is refused, never silently retiered.
+      const tierError = controlTierError(session.key, operatorOpenId);
+      if (tierError) return { status: 'denied', message: tierError };
+      const rec = await getSession(session.key);
+      if (
+        !rec ||
+        rec.chatId !== project.chatId ||
+        rec.sessionId !== session.sessionId ||
+        rec.backend !== session.backend ||
+        rec.cwd !== session.cwd
+      ) {
+        return { status: 'stale', message: '⚠️ 会话映射已变化，请刷新面板后重试。' };
+      }
+      if (active.get(session.key)) return { status: 'busy', message: '⚠️ 所选会话正在运行或排队，未发送「继续」。' };
+      const flat = (latest.kind ?? 'multi') === 'single';
+      const synthetic = syntheticControlMessage({
+        chatId: latest.chatId,
+        sessionKey: session.key,
+        flat,
+        operatorOpenId,
+        text: '继续',
+        kind: 'continue',
+      });
+      controlTurnOptions.set(synthetic.messageId, {
+        requireIdle: true,
+        suppressReceipt: true,
+        expectedSession: { sessionId: session.sessionId, backend: session.backend, cwd: session.cwd },
+      });
+      await handleTurn(synthetic, '继续', session.key, flat, latest, groupTurnPerm(latest, session.key, operatorOpenId));
+      return { status: 'ok' };
+    },
+    interruptSession: async ({ sessionKey, runToken, operatorOpenId }) => {
+      const tierError = controlTierError(sessionKey, operatorOpenId);
+      if (tierError) return { status: 'denied', message: tierError };
+      const state = active.get(sessionKey);
+      if (!state || state !== runToken || state.isGoal) {
+        return { status: 'stale', message: '⚠️ 该轮运行已结束或被替换，请刷新面板。' };
+      }
+      if (operatorOpenId !== state.requesterOpenId && !isAdmin(cfg, operatorOpenId)) {
+        return { status: 'denied', message: '⚠️ 仅发起人或管理员可停止。' };
+      }
+      const interrupt = state.interrupt;
+      if (!interrupt) return { status: 'stale', message: '⚠️ 该轮运行已结束或被替换，请刷新面板。' };
+      interrupt();
+      return { status: 'ok' };
+    },
+    startGoalSession: async ({ project, session, objective, operatorOpenId }) => {
+      const latest = await reloadProjectForControl(project);
+      if ('failure' in latest) return { status: 'stale', message: `⚠️ ${latest.failure}` };
+      // Same final tier gate as 「继续」: no cross-tier goal start, no retiering.
+      const tierError = controlTierError(session.key, operatorOpenId);
+      if (tierError) return { status: 'denied', message: tierError };
+      if (!(backendFor(session.backend).capabilities?.goal ?? true)) {
+        return { status: 'unsupported', message: '当前后端不支持自主目标。' };
+      }
+      const rec = await getSession(session.key);
+      if (
+        !rec ||
+        rec.chatId !== project.chatId ||
+        rec.sessionId !== session.sessionId ||
+        rec.backend !== session.backend ||
+        rec.cwd !== session.cwd
+      ) {
+        return { status: 'stale', message: '⚠️ 会话映射已变化，请刷新面板后重试。' };
+      }
+      if (active.get(session.key)) return { status: 'busy', message: '⚠️ 所选会话正在运行，暂不能启动目标。' };
+      const flat = (latest.kind ?? 'multi') === 'single';
+      const synthetic = syntheticControlMessage({
+        chatId: latest.chatId,
+        sessionKey: session.key,
+        flat,
+        operatorOpenId,
+        text: objective,
+        kind: 'goal',
+      });
+      startReservedRun(
+        synthetic,
+        objective,
+        session.key,
+        flat,
+        latest,
+        groupTurnPerm(latest, session.key, operatorOpenId),
+        undefined,
+        undefined,
+        objective,
+        true,
+        {
+          requireIdle: true,
+          expectedSession: { sessionId: session.sessionId, backend: session.backend, cwd: session.cwd },
+        },
+      );
+      return { status: 'ok' };
+    },
+    endGoalSession: async ({ sessionKey, runToken, operatorOpenId }) => {
+      const tierError = controlTierError(sessionKey, operatorOpenId);
+      if (tierError) return { status: 'denied', message: tierError };
+      const state = active.get(sessionKey);
+      if (!state || state !== runToken || !state.isGoal) {
+        return { status: 'stale', message: '⚠️ 该目标运行已结束或被替换，请刷新面板。' };
+      }
+      if (operatorOpenId !== state.requesterOpenId && !isAdmin(cfg, operatorOpenId)) {
+        return { status: 'denied', message: '⚠️ 仅发起人或管理员可结束目标。' };
+      }
+      // Existing goal interrupt path: clearGoal + stop the current turn. The old
+      // endGoal path deliberately lets the in-flight turn finish, which would
+      // contradict the approved 「结束目标并停止」 label.
+      const interrupt = state.interrupt;
+      if (!interrupt) return { status: 'stale', message: '⚠️ 该目标运行已结束或被替换，请刷新面板。' };
+      interrupt();
+      return { status: 'ok' };
+    },
+  });
+
+  const groupControlContext = (evt: CardActionEvent): GroupControlContext => ({
+    chatId: evt.chatId,
+    operatorOpenId: evt.operator?.openId ?? '',
+    sourceMessageId: evt.messageId,
+  });
+
+  /**
+   * The persistent entry card is ONE message whose button values would never
+   * change on their own — the node-sdk card-action dedupe (12h, keyed on
+   * message+user+value) would therefore deliver only the first click. After
+   * handling an entry-card click, re-render its CardKit entity: the next real
+   * click presents a new value (fires), while a redelivery of the click already
+   * handled keeps its original value and stays idempotent. The entity id is
+   * persisted by the installer, so this also works after a restart.
+   */
+  const rotateEntryCard = (evt: CardActionEvent): void => {
+    void (async () => {
+      try {
+        const project = await getProjectByChatId(evt.chatId);
+        if (!project) return;
+        await refreshGroupEntryCard(channel, project, { messageId: evt.messageId });
+      } catch (err) {
+        log.fail('card', err, { phase: 'group-entry-rotate' });
+      }
+    })();
+  };
+
+  dispatcher
+    .on(GC.sessions, ({ evt }) => {
+      rotateEntryCard(evt);
+      void groupControls.openSessions(groupControlContext(evt));
+    })
+    .on(GC.help, ({ evt }) => {
+      rotateEntryCard(evt);
+      void groupControls.openHelp(groupControlContext(evt));
+    })
+    .on(GC.select, ({ evt, value }) => {
+      void groupControls.select(
+        groupControlContext(evt),
+        typeof value.t === 'string' ? value.t : undefined,
+        typeof value.k === 'string' ? value.k : undefined,
+      );
+    })
+    .on(GC.page, ({ evt, value }) => {
+      void groupControls.page(
+        groupControlContext(evt),
+        typeof value.t === 'string' ? value.t : undefined,
+        typeof value.p === 'number' ? value.p : Number(value.p),
+      );
+    })
+    .on(GC.refresh, ({ evt, value }) => {
+      void groupControls.refresh(groupControlContext(evt), typeof value.t === 'string' ? value.t : undefined);
+    })
+    .on(GC.continue, ({ evt, value }) => {
+      void groupControls.continueSession(groupControlContext(evt), typeof value.t === 'string' ? value.t : undefined);
+    })
+    .on(GC.interrupt, ({ evt, value }) => {
+      void groupControls.interrupt(groupControlContext(evt), typeof value.t === 'string' ? value.t : undefined);
+    })
+    .on(GC.goalForm, ({ evt, value }) => {
+      void groupControls.goalForm(groupControlContext(evt), typeof value.t === 'string' ? value.t : undefined);
+    })
+    .on(GC.goalSubmit, ({ evt, value, formValue }) => {
+      void groupControls.goalSubmit(
+        groupControlContext(evt),
+        typeof value.t === 'string' ? value.t : undefined,
+        formValue,
+      );
+    })
+    .on(GC.goalEnd, ({ evt, value }) => {
+      void groupControls.goalEnd(groupControlContext(evt), typeof value.t === 'string' ? value.t : undefined);
+    });
 
   // ⏹/🎯 被拒点击分类反馈（M-4 / audit-03 ②）：原来三类点击全部静默吞掉，
   // 「点了毫无反应」。SDK 的 normalized cardAction 链路丢弃 handler 返回值，
@@ -4825,6 +5327,7 @@ export function createOrchestrator(
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
     state.thread = opts.thread;
     state.isGoal = true; // messages during the goal get a prompt, never queue (handleTurn)
+    state.goalObjective = objective;
     if (opts.requesterOpenId) state.requesterOpenId = opts.requesterOpenId;
     active.set(activeKey, state);
     if (opts.knownThreadId) trackSession(opts.knownThreadId, opts.thread);
@@ -5707,6 +6210,7 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     shuttingDown = true;
+    groupControls.shutdown();
     await accountCommands.drain();
     await runtimeCommands.drain();
     clearInterval(reaper);

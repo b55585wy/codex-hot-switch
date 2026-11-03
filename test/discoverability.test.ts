@@ -1,10 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { rm } from 'node:fs/promises';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { DISCOVERY_SCOPES, GRANT_SCOPES, REQUIRED_SCOPES, SCOPE_LABELS } from '../src/config/scopes';
 import { OPTIONAL_EVENTS, REQUIRED_EVENTS } from '../src/utils/event-diagnosis';
 import { classifyReaction, CONTINUE_EMOJIS, STOP_EMOJIS } from '../src/bot/handle-message';
 import { onboardGroup, sidebarPcUrl } from '../src/project/onboarding';
+import { botDir, useBotDir } from '../src/config/paths';
 import type { Project } from '../src/project/registry';
+
+// onboarding now writes versioned group-menu state (entry card id / menu ids).
+// Point this file at a throwaway per-bot dir so tests never touch real state.
+const testBotId = `vitest-discoverability-${process.pid}`;
+beforeAll(() => {
+  useBotDir(testBotId);
+});
+afterAll(async () => {
+  await rm(botDir(testBotId), { recursive: true, force: true }).catch(() => undefined);
+});
 
 // ── M-6 群内可发现性三件套：scope / 事件清单 ─────────────────────────
 

@@ -69,6 +69,10 @@ export const paths = {
   get projectsFile(): string {
     return join(currentBotDir, 'projects.json');
   },
+  /** 群菜单/常驻入口卡的版本化安装元数据（当前 bot） */
+  get groupMenusFile(): string {
+    return join(currentBotDir, 'group-menus.json');
+  },
   /** 在跑的 start 进程注册中心（同 App 冲突检测；当前 bot） */
   get processesFile(): string {
     return join(currentBotDir, 'processes.json');

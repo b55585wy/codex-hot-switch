@@ -3,6 +3,7 @@ import { log } from '../core/logger';
 import { buildWelcomeCard } from '../card/command-cards';
 import { createBackend, catalogById } from '../agent';
 import { defaultNoMention, type Project } from './registry';
+import { HELP_DOC_URL, installGroupMenus } from './group-menu';
 
 /** 项目后端的能力位（用于欢迎卡按后端裁剪命令）。未知/手编 id 解析失败 ⇒ undefined
  * （= 全列，与 codex 一致），绝不因此让建项目/绑群失败。 */
@@ -26,7 +27,6 @@ function welcomeAgentName(backend?: string): string {
  * Empty string = skip the tab + the manual button (no broken links). Set this
  * to the doc's share URL once it's published as "互联网获取链接的人可阅读".
  */
-const HELP_DOC_URL: string = 'https://my.feishu.cn/wiki/PZ23wGr7JiKK5RkIG4rcZXzGn5g';
 
 /**
  * PC 端深链：让群菜单的链接在飞书**侧边栏**打开而不是弹独立浏览器（官方
@@ -96,30 +96,20 @@ export async function onboardGroup(channel: LarkChannel, project: Project): Prom
     }
   }
 
-  // 3. 群菜单「🤖 <后端名>」→ 命令手册（M-6 群内可发现性）。群菜单常驻输入框上方，
-  //    可见性远高于群 Tab；动作只支持 REDIRECT_LINK —— PC 端加 applink
-  //    sidebar-semi 前缀在侧边栏打开，移动端走原链接。需可选 scope
-  //    im:chat.menu_tree:write_only：未开通时 create 报错 → log + 跳过，
-  //    其余 onboarding 不受影响（与 Pin/Tab 一致的 best-effort 语义）。
-  if (decorate && HELP_DOC_URL) {
+  // 3. 群菜单：会话 / 操作 / 帮助（群内常驻输入框上方，M-6 可发现性）。
+  //    新编辑器优先安装三个原生菜单并复用本群常驻入口卡；缺 scope / 拿不到入口
+  //    消息位置时降级为旧版「🤖 <后端名>」帮助菜单，并保留 /controls 兜底。
+  //    fallbackLegacyMenu 只在这里显式开启：onboarding 面对的是 Bridge 刚建的群
+  //    （或直接跳过的 joined 群），是唯一「已知空群」的场景；老群回填与管理员的
+  //    /controls setup 一律默认关闭，读失败时绝不盲写。
+  if (decorate) {
     try {
-      await channel.rawClient.im.v1.chatMenuTree.create({
-        path: { chat_id: chatId },
-        data: {
-          menu_tree: {
-            chat_menu_top_levels: [
-              {
-                chat_menu_item: {
-                  action_type: 'REDIRECT_LINK',
-                  name: `🤖 ${agentName}`,
-                  redirect_link: { common_url: HELP_DOC_URL, pc_url: sidebarPcUrl(HELP_DOC_URL) },
-                },
-              },
-            ],
-          },
-        },
+      const result = await installGroupMenus(channel, project, {
+        allowJoined: false,
+        fallbackLegacyMenu: true,
+        backendName: agentName,
       });
-      log.info('project', 'onboard-menu', { name: project.name });
+      log.info('project', 'onboard-menu', { name: project.name, status: result.status, reason: result.reason });
     } catch (err) {
       log.fail('project', err, { phase: 'onboard-menu' });
     }

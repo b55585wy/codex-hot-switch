@@ -6,6 +6,7 @@ import { sep } from 'node:path';
 import { createOrchestrator } from './handle-message';
 import { paths } from '../config/paths';
 import { listProjects } from '../project/registry';
+import { backfillGroupMenus } from '../project/group-menu';
 import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
 
 /** True when `cwd` is a registered project's working dir (or a subdir of one) —
@@ -143,6 +144,14 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   channel.on('reconnected', () => log.info('ws', 'reconnected'));
 
   await channel.connect();
+  // Native group menus + persistent entry cards: one bounded, sequential repair
+  // pass for existing Bridge-created projects. It starts only after the channel
+  // is live and is cancelled by shutdown. Nonfatal by design (missing
+  // im:chat.menu_tree scope must never block message handling).
+  const groupMenuAbort = new AbortController();
+  void backfillGroupMenus(channel, { signal: groupMenuAbort.signal })
+    .then((summary) => log.info('project', 'group-menu-backfill-done', { ...summary }))
+    .catch((err) => log.fail('project', err, { phase: 'group-menu-backfill' }));
   // Never let an optional local-agent IPC bind failure (EADDRINUSE/EACCES) tear
   // down an already-connected bot — log and stay up, mirroring shutdown's catch.
   if (shouldStartCliBridge(opts.cfg)) {
@@ -154,6 +163,7 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    groupMenuAbort.abort();
     await orchestrator.shutdown();
     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
