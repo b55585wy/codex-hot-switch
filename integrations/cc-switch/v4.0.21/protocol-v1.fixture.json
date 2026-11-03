@@ -1,0 +1,13 @@
+{
+  "fixtureOnly": true,
+  "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "json": "{\"version\":1,\"operation\":\"status\",\"nonce\":\"00112233445566778899aabbccddeeff\",\"issuedAt\":1730000000000}",
+  "payload": "eyJ2ZXJzaW9uIjoxLCJvcGVyYXRpb24iOiJzdGF0dXMiLCJub25jZSI6IjAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmIiwiaXNzdWVkQXQiOjE3MzAwMDAwMDAwMDB9",
+  "signature": "5666c8ebd8c2cc03e338b91b7b4f09cb3849662d66a0d142ac4b64af757b54f5",
+  "accountVectors": [
+    { "localId": "fixture-account-a", "accountCode": "ccs-aeda2df6ebc6" },
+    { "localId": "fixture-account-b", "accountCode": "ccs-1e35a621a11a" },
+    { "localId": "test", "accountCode": "ccs-a2ca5fa7ff36" },
+    { "localId": "账号-甲", "accountCode": "ccs-dd7521347109" }
+  ]
+}
