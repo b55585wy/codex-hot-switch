@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -121,7 +121,8 @@ describe.skipIf(!isWindows)('codex-managed launcher', () => {
     const recorded = JSON.parse(readFileSync(fake.argsFile, 'utf8'));
     expect(recorded.script).toBe('run');
     expect(recorded.args).toEqual(['--codex-bin', native, '--', ...forwarded]);
-    expect(recorded.cwd.toLowerCase()).toBe(work.toLowerCase());
+    // Windows can report the same directory through its 8.3 short-name alias.
+    expect(realpathSync.native(recorded.cwd).toLowerCase()).toBe(realpathSync.native(work).toLowerCase());
   });
 
   it('fails clearly when CODEX_SWITCH_BIN points at a missing file', () => {
