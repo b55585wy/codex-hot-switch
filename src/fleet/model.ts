@@ -12,6 +12,8 @@ export interface FleetConfig {
   appToken: string;
   tables: { nodes: string; routes: string; commands: string };
   pollMs?: number;
+  /** Optional local transport for the fleet/shared-Bitable SDK client only. */
+  apiProxyUrl?: string;
 }
 export interface FleetNode {
   id: string;
@@ -129,6 +131,31 @@ export function isOnline(node: FleetNode, now = Date.now()): boolean {
   return node.seenAt <= now + 30_000 && now - node.seenAt <= ONLINE_MS;
 }
 
+export function validateFleetApiProxyUrl(value: string): void {
+  if (typeof value !== 'string' || !value || value !== value.trim()) {
+    throw new Error('多电脑本地 API 代理地址无效：请填写不含首尾空白的 HTTP 或 HTTPS URL');
+  }
+  if (/[\u0000-\u001f\u007f\s]/.test(value)) {
+    throw new Error('多电脑本地 API 代理地址无效：不能包含空白或控制字符');
+  }
+  if (!/^https?:\/\/[^/?#]/i.test(value)) {
+    throw new Error('多电脑本地 API 代理地址无效：请填写完整的 HTTP 或 HTTPS URL');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('多电脑本地 API 代理地址无效：请填写完整的 HTTP 或 HTTPS URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('多电脑本地 API 代理地址仅支持 http:// 或 https://');
+  }
+  if (!parsed.hostname) throw new Error('多电脑本地 API 代理地址缺少主机名');
+  if (parsed.username || parsed.password) {
+    throw new Error('多电脑本地 API 代理地址不能包含用户名或密码');
+  }
+}
+
 export function validateFleetConfig(cfg: FleetConfig): void {
   if (!/^[a-f0-9-]{36}$/i.test(cfg.nodeId)) throw new Error('多电脑配置缺少有效设备 ID');
   if (!cfg.name?.trim() || cfg.name.length > 32) throw new Error('电脑名应为 1–32 个字符');
@@ -139,4 +166,5 @@ export function validateFleetConfig(cfg: FleetConfig): void {
   if (cfg.pollMs !== undefined && (!Number.isFinite(cfg.pollMs) || cfg.pollMs < 5_000 || cfg.pollMs > 60_000)) {
     throw new Error('多电脑轮询间隔必须在 5–60 秒之间');
   }
+  if (cfg.apiProxyUrl !== undefined) validateFleetApiProxyUrl(cfg.apiProxyUrl);
 }

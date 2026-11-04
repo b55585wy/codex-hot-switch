@@ -12,6 +12,7 @@ import { BitableFleetStorage } from './bitable';
 import { FleetInbox } from './inbox';
 import { FleetDeliveryUnknown, FleetRuntime } from './runtime';
 import { SignedFleetStore, digest, eventActor, isOnline, validateFleetConfig, type FleetEvent, type FleetNode } from './model';
+import { selectFleetApiClient } from './transport';
 import { installFleetHooks } from './hooks';
 import { setFleetNodeId } from './context';
 
@@ -47,7 +48,11 @@ export function createFleetBridge(channel: LarkChannel, cfg: AppConfig, secret: 
   validateFleetConfig(config);
   setFleetNodeId(config.nodeId);
   const onError = (error: unknown): void => log.fail('fleet', error);
-  const store = new SignedFleetStore(new BitableFleetStorage(channel.rawClient, config), cfg.accounts.app.id, secret);
+  // The optional local proxy applies only to shared Bitable traffic, never to
+  // the ordinary bot channel or any other Codex/tool HTTP client.
+  const fleetClient = selectFleetApiClient(channel.rawClient, { appId: cfg.accounts.app.id, appSecret: secret,
+    tenant: cfg.accounts.app.tenant, apiProxyUrl: config.apiProxyUrl });
+  const store = new SignedFleetStore(new BitableFleetStorage(fleetClient, config), cfg.accounts.app.id, secret);
   const reply = async (event: FleetEvent, text: string): Promise<void> => {
     const chatId = event.data.chatId;
     if (typeof chatId === 'string' && chatId) {

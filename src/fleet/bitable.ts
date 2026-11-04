@@ -4,6 +4,39 @@ import { digest } from './model';
 
 type Row = { record_id?: string; fields?: Record<string, unknown> };
 const TABLE_NAMES = { nodes: 'Bridge电脑', routes: 'Bridge路由', commands: 'Bridge指令' } as const;
+const FLEET_READ_RETRY_DELAY_MS = 250;
+// Only transport failures that are safe to retry for an idempotent read.
+const FLEET_TRANSIENT_READ_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE', 'ENETRESET', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'ERR_SOCKET_CONNECTION_TIMEOUT',
+]);
+
+export function isFleetTransientReadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { name?: unknown; code?: unknown; message?: unknown; response?: unknown; __CANCEL__?: unknown };
+  if (candidate.__CANCEL__ === true || candidate.name === 'CanceledError' || candidate.code === 'ERR_CANCELED') return false;
+  // An HTTP response exists, so this is an API/business/permission/rate-limit failure.
+  if (candidate.response != null) return false;
+  if (typeof candidate.code === 'string' && FLEET_TRANSIENT_READ_CODES.has(candidate.code)) return true;
+  return typeof candidate.message === 'string'
+    && /(?:Client network socket disconnected before secure TLS connection was established|socket hang up|ECONNRESET|timeout of \d+ms exceeded)/i.test(candidate.message);
+}
+
+export async function fleetReadWithRetry<T>(read: () => Promise<T>, delayMs = FLEET_READ_RETRY_DELAY_MS): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    if (!isFleetTransientReadError(error)) throw error;
+  }
+  await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+  try {
+    return await read();
+  } catch (error) {
+    if (!isFleetTransientReadError(error)) throw error;
+    throw new Error('多电脑共享表读取因网络暂时中断失败，当前任务状态未知；请先查看原话题或目标电脑状态，不要直接重复发送。',
+      { cause: error });
+  }
+}
 
 function checkFleetResponse<T extends { code?: number; msg?: string }>(response: T): T {
   if (response.code !== undefined && response.code !== 0) {
@@ -34,10 +67,10 @@ export class BitableFleetStorage implements FleetStorage {
     const rows: Row[] = [];
     let page: string | undefined;
     do {
-      const response = checkFleetResponse(await this.client.bitable.appTableRecord.list({
+      const response = checkFleetResponse(await fleetReadWithRetry(() => this.client.bitable.appTableRecord.list({
         path: { app_token: this.config.appToken, table_id: this.config.tables[table] },
         params: { page_size: 100, ...(expression ? { filter: expression } : {}), ...(page ? { page_token: page } : {}) },
-      }));
+      })));
       rows.push(...(response.data?.items ?? []));
       page = response.data?.has_more ? response.data.page_token : undefined;
       if (rows.length > 10_000) throw new Error('多电脑数据表记录过多，请先清理过期指令');

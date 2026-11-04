@@ -73,6 +73,27 @@ describe('fleet setup lifecycle', () => {
     await runFleetSetup({ name: 'mac', base: 'appToken12345' });
     expect(setup.cfg).toMatchObject({ fleet: { enabled: true, nodeId: identity } });
   });
+  it('preserves the optional local API transport setting across setup', async () => {
+    setup.cfg.fleet = { enabled: false, nodeId: '11111111-1111-4111-8111-111111111111', name: 'windows',
+      appToken: 'appToken12345', tables: { nodes: 'tblNodes', routes: 'tblRoutes', commands: 'tblCommands' },
+      pollMs: 15000, apiProxyUrl: 'http://127.0.0.1:7897' };
+    await runFleetSetup({ name: 'windows', base: 'appToken12345' });
+    expect(setup.saves).toHaveLength(2);
+    expect(setup.saves[0]).toMatchObject({ fleet: { enabled: false, apiProxyUrl: 'http://127.0.0.1:7897' } });
+    expect(setup.saves[1]).toMatchObject({ fleet: { enabled: true, apiProxyUrl: 'http://127.0.0.1:7897' } });
+  });
+
+  it('rejects a malformed or credential-bearing local API proxy before saving', async () => {
+    for (const apiProxyUrl of ['ftp://proxy.test:7897', 'http://user:pass@127.0.0.1:7897']) {
+      setup.saves = [];
+      setup.cfg.fleet = { enabled: false, nodeId: '11111111-1111-4111-8111-111111111111', name: 'windows',
+        appToken: 'appToken12345', tables: { nodes: 'tblNodes', routes: 'tblRoutes', commands: 'tblCommands' },
+        pollMs: 15000, apiProxyUrl };
+      await expect(runFleetSetup({ name: 'windows', base: 'appToken12345' })).rejects.toThrow('代理地址');
+      expect(setup.saves).toHaveLength(0);
+    }
+  });
+
   it('does not modify a configuration being written by a running daemon', async () => {
     setup.live = true;
     await expect(runFleetSetup({ name: 'mac', base: 'appToken12345' })).rejects.toThrow('停止');

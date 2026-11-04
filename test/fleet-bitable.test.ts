@@ -60,6 +60,94 @@ describe('Feishu Bitable transport contract', () => {
     expect(fake.bitable.appTableRecord.update).not.toHaveBeenCalled();
     expect(fake.bitable.appTableRecord.create).not.toHaveBeenCalled();
   });
+  it('retries one proven transient TLS read and succeeds on the second attempt', async () => {
+    const fake = client(); const store = new BitableFleetStorage(fake as unknown as Client, config);
+    fake.bitable.appTableRecord.list
+      .mockRejectedValueOnce(Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'),
+        { code: 'ECONNRESET' }))
+      .mockResolvedValueOnce({ code: 0, data: { items: [{ fields: { key: 'a', data: 'one', target: 'mac' } }] } });
+    vi.useFakeTimers();
+    try {
+      const pending = store.list('commands', 'mac');
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(pending).resolves.toMatchObject([{ key: 'a', value: 'one' }]);
+      expect(fake.bitable.appTableRecord.list).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('stops at two attempts and reports an indeterminate read without claiming it did not execute', async () => {
+    const fake = client(); const store = new BitableFleetStorage(fake as unknown as Client, config);
+    fake.bitable.appTableRecord.list
+      .mockRejectedValueOnce(Object.assign(new Error('timeout of 10000ms exceeded'), { code: 'ETIMEDOUT' }))
+      .mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    vi.useFakeTimers();
+    try {
+      const pending = store.get('nodes', 'a');
+      const result = expect(pending).rejects.toThrow('当前任务状态未知');
+      await vi.advanceTimersByTimeAsync(250);
+      await result;
+      expect(fake.bitable.appTableRecord.list).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('never retries cancellation, HTTP status, permission, quota or business errors', async () => {
+    const failures: Array<[unknown, string]> = [
+      [Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' }), 'canceled'],
+      [Object.assign(new Error('Request failed with status code 401'), { response: { status: 401 } }), '401'],
+      [Object.assign(new Error('Request failed with status code 403'), { response: { status: 403 } }), '403'],
+      [Object.assign(new Error('Request failed with status code 429'), { response: { status: 429 } }), '429'],
+    ];
+    for (const [error, text] of failures) {
+      const fake = client(); const store = new BitableFleetStorage(fake as unknown as Client, config);
+      fake.bitable.appTableRecord.list.mockRejectedValueOnce(error);
+      await expect(store.get('nodes', 'a')).rejects.toThrow(text);
+      expect(fake.bitable.appTableRecord.list).toHaveBeenCalledTimes(1);
+    }
+    const quota = client(); const quotaStore = new BitableFleetStorage(quota as unknown as Client, config);
+    quota.bitable.appTableRecord.list.mockResolvedValueOnce({ code: 1254290, msg: 'rate limited' });
+    await expect(quotaStore.list('commands', 'mac')).rejects.toThrow('1254290');
+    expect(quota.bitable.appTableRecord.list).toHaveBeenCalledTimes(1);
+    const business = client(); const businessStore = new BitableFleetStorage(business as unknown as Client, config);
+    business.bitable.appTableRecord.list.mockResolvedValueOnce({ code: 99991400, msg: 'invalid request' });
+    await expect(businessStore.get('nodes', 'a')).rejects.toThrow('99991400');
+    expect(business.bitable.appTableRecord.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('may retry source lookup reads inside put and remove but never replays a write', async () => {
+    const putFake = client(); const putStore = new BitableFleetStorage(putFake as unknown as Client, config);
+    putFake.bitable.appTableRecord.list
+      .mockRejectedValueOnce(Object.assign(new Error('read reset'), { code: 'ECONNRESET' }))
+      .mockResolvedValueOnce({ code: 0, data: { items: [] } });
+    vi.useFakeTimers();
+    try {
+      const pending = putStore.put('commands', { key: 'stable', value: '{}' });
+      await vi.advanceTimersByTimeAsync(250);
+      await pending;
+      expect(putFake.bitable.appTableRecord.list).toHaveBeenCalledTimes(2);
+      expect(putFake.bitable.appTableRecord.create).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+
+    const createFake = client(); const createStore = new BitableFleetStorage(createFake as unknown as Client, config);
+    createFake.bitable.appTableRecord.create.mockRejectedValueOnce(Object.assign(new Error('connection lost after send'),
+      { code: 'ECONNRESET' }));
+    await expect(createStore.put('commands', { key: 'uncertain', value: '{}' })).rejects.toThrow('connection lost');
+    expect(createFake.bitable.appTableRecord.create).toHaveBeenCalledTimes(1);
+
+    const updateFake = client(); const updateStore = new BitableFleetStorage(updateFake as unknown as Client, config);
+    updateFake.bitable.appTableRecord.list.mockResolvedValueOnce({ code: 0, data: { items: [
+      { record_id: 'r1', fields: { key: 'owned', data: '{"value":"one"}' } }] } });
+    updateFake.bitable.appTableRecord.update.mockRejectedValueOnce(Object.assign(new Error('update reset'), { code: 'ECONNRESET' }));
+    await expect(updateStore.put('routes', { key: 'owned', value: '{"value":"two"}' })).rejects.toThrow('update reset');
+    expect(updateFake.bitable.appTableRecord.update).toHaveBeenCalledTimes(1);
+
+    const deleteFake = client(); const deleteStore = new BitableFleetStorage(deleteFake as unknown as Client, config);
+    deleteFake.bitable.appTableRecord.list.mockResolvedValueOnce({ code: 0, data: { items: [
+      { record_id: 'r1', fields: { key: 'old', data: '{}' } }] } });
+    deleteFake.bitable.appTableRecord.delete.mockRejectedValueOnce(Object.assign(new Error('delete reset'), { code: 'ECONNRESET' }));
+    await expect(deleteStore.remove('commands', 'old')).rejects.toThrow('delete reset');
+    expect(deleteFake.bitable.appTableRecord.delete).toHaveBeenCalledTimes(1);
+  });
+
   it('creates only the dedicated fleet tables with required fields', async () => {
     const fake = client();
     expect(await ensureFleetTables(fake as unknown as Client, config.appToken)).toEqual({ nodes: 'tblCreated', routes: 'tblCreated', commands: 'tblCreated' });

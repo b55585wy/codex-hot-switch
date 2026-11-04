@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { Client, Domain } from '@larksuiteoapi/node-sdk';
 import { paths, useBotDir } from '../../config/paths';
 import { addBot, currentBot, ensureRegistry, findBot, uniqueName } from '../../config/bots';
 import { buildEncryptedAccountConfig, loadConfig, saveConfig } from '../../config/store';
@@ -10,7 +9,8 @@ import { validateAppCredentials } from '../../utils/feishu-auth';
 import { isServiceRunning } from '../../service/adapter';
 import { ensureFleetTables } from '../../fleet/bitable';
 import { BitableFleetStorage } from '../../fleet/bitable';
-import { SignedFleetStore, validateFleetConfig, type FleetConfig } from '../../fleet/model';
+import { SignedFleetStore, validateFleetApiProxyUrl, validateFleetConfig, type FleetConfig } from '../../fleet/model';
+import { createFleetApiClient } from '../../fleet/transport';
 
 export function parseBaseToken(input: string): string {
   if (/^[a-zA-Z0-9]{10,}$/.test(input)) return input;
@@ -60,7 +60,11 @@ export async function runFleetSetup(options: {
   const secret = newSecret ?? await resolveAppSecret(cfg as AppConfig);
   const checked = await validateAppCredentials(appId, secret, tenant as TenantBrand);
   if (!checked.ok) throw new Error(`机器人凭据或网络校验失败：${checked.reason}`);
-  const client = new Client({ appId, appSecret: secret, domain: tenant === 'lark' ? Domain.Lark : Domain.Feishu });
+  // This optional local transport setting survives setup/restart; it is not a
+  // remote identity and does not change global routing or OS proxy settings.
+  const apiProxyUrl = cfg.fleet?.apiProxyUrl;
+  if (apiProxyUrl !== undefined) validateFleetApiProxyUrl(apiProxyUrl);
+  const client = createFleetApiClient({ appId, appSecret: secret, tenant: tenant as TenantBrand, apiProxyUrl });
   const nodeId = cfg.fleet?.nodeId ?? randomUUID();
   const pollMs = options.pollMs === undefined ? 15_000 : Number(options.pollMs);
   if (newSecret) {
@@ -74,13 +78,15 @@ export async function runFleetSetup(options: {
   // Persist a disabled stable identity before touching shared tables, so an interrupted
   // setup keeps the same device ID and local preferences/credentials.
   const identity: FleetConfig = { enabled: false, nodeId, name: options.name.trim(), appToken,
-    tables: cfg.fleet?.tables ?? { nodes: '', routes: '', commands: '' }, pollMs };
+    tables: cfg.fleet?.tables ?? { nodes: '', routes: '', commands: '' }, pollMs,
+    ...(apiProxyUrl !== undefined ? { apiProxyUrl } : {}) };
   const pending = 'tblPending';
   validateFleetConfig({ ...identity, tables: { nodes: pending, routes: pending, commands: pending } });
   cfg.fleet = identity;
   await saveConfig(cfg);
   const tables = await ensureFleetTables(client, appToken);
-  const config: FleetConfig = { enabled: true, nodeId, name: options.name.trim(), appToken, tables, pollMs };
+  const config: FleetConfig = { enabled: true, nodeId, name: options.name.trim(), appToken, tables, pollMs,
+    ...(apiProxyUrl !== undefined ? { apiProxyUrl } : {}) };
   validateFleetConfig(config);
   const store = new SignedFleetStore(new BitableFleetStorage(client, config), appId, secret);
   if (!await store.get('routes', 'home')) await store.put('routes', 'home', { nodeId: config.nodeId });
