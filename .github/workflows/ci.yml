@@ -41,6 +41,8 @@ jobs:
         run: npm test
       - name: Private edition extension regressions
         run: npm run test:extensions
+      - name: Realtime relay across independent processes
+        run: npm run test:relay-process
       - name: Prepare user systemd manager
         if: runner.os == 'Linux' && matrix.node == 24
         shell: bash

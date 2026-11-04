@@ -30,6 +30,7 @@
     "test": "vitest run",
     "test:fleet": "vitest run fleet-",
     "test:native-service": "node scripts/test-native-service.mjs",
+    "test:relay-process": "node scripts/test-relay-process.cjs",
     "start": "node bin/feishu-codex-bridge.mjs run",
     "prepare": "npm run build",
     "release": "bash scripts/release.sh",

@@ -28,6 +28,8 @@ Extend `FleetNode` with optional `kind: 'worker' | 'gateway'`. Existing nodes wi
 
 Worker mode constructs the existing orchestrator/HTTP sender but opens no Feishu event WebSocket. Only the gateway opens that receiver. Workers dispatch forwarded events through the original onMessage/cardAction/reaction/comment/botAdded/botRemoved/botMenu handlers and preserve every original field, thread ID, operation value and render token. Local account, project, user and group checks still run at the destination.
 
+`FleetRuntime.start(beforeConsume?)` provides the activation window after home/migration/publication/project validation and before the first drain. The retained callback also runs after reconnect publication/sync. Workers select caller-managed activation so a replacement socket remains inactive until this callback succeeds; direct clients restore only previously acknowledged activation. Disabled relay configurations fail closed instead of opening a local Feishu receiver.
+
 ## Shared storage hooks
 
 Preserve existing FleetStorage methods. Add optional hooks:

@@ -217,7 +217,7 @@ by itself; stop the old receiver only at the documented deployment step.
 ```sh
 # Stop this bot's foreground `run` and background `start` first. Setup also
 # takes the existing per-bot single-instance lock and refuses while either runs.
-printf '%s' "$CODEX_RELAY_TOKEN" | feishu-codex-bridge fleet relay setup \
+printf '%s' "$CODEX_RELAY_TOKEN" | node bin/feishu-codex-bridge.mjs fleet relay setup \
   --url wss://relay.example.com \
   --token-stdin \
   --name windows-office \
@@ -227,25 +227,35 @@ printf '%s' "$CODEX_RELAY_TOKEN" | feishu-codex-bridge fleet relay setup \
 #   --proxy-url http://127.0.0.1:7897
 
 # Explicit one-time metadata import from the previous Bitable directory:
-printf '%s' "$CODEX_RELAY_TOKEN" | feishu-codex-bridge fleet relay setup \
+printf '%s' "$CODEX_RELAY_TOKEN" | node bin/feishu-codex-bridge.mjs fleet relay setup \
   --url wss://relay.example.com --token-stdin --import-from-bitable
 ```
 
 `--url` accepts `wss://host` or the fixed `wss://host/relay/v1`; public plain
-`ws://` is rejected (loopback only). The relay token is read from stdin, must
-be at least 32 bytes/high entropy, and is stored only in the native encrypted
-keystore as `relay.tokenSecretId`. It is not the Feishu App Secret, is never in
+`ws://` is rejected (loopback only). `--app-id` is validated before any bot
+directory is selected. The relay token is read from stdin (bound to 1024 bytes
+of input), must be at least 32 bytes/high entropy and at most 512 characters,
+and is stored only in the native encrypted keystore under a **new versioned**
+`relay.tokenSecretId`. It is not the Feishu App Secret, is never in
 argv/URLs/logs/JSON output, and never replaces the existing App Secret.
 
 Setup reuses the selected complete bot directory and preserves owner/admin
 preferences, project/session/inbox state, legacy Bitable fields and the stable
-node ID. A pending identity file (`fleet/relay-setup-pending.json`) preserves
-the new identity across interruption; the previous working config is not
-rewritten to disabled. The token/config are committed only after an inactive
-worker connection validates the namespace/shared metadata and any requested
-import is ready. On failure, the previous config/token are restored; a token
-newly created by the failed attempt is removed, while a same-endpoint token
-change restores the prior value.
+node ID. The existing per-bot single-instance lock is acquired before any
+configuration write, secret change or import. A pending identity file
+(`fleet/relay-setup-pending.json`) preserves the new identity across
+interruption; the previous working config is not rewritten to disabled. The
+token/config are committed only after an inactive worker connection validates
+the namespace/shared metadata and any requested import is ready.
+
+Each commit writes a new token secret and then atomically saves the config. The
+old token key/value is never overwritten, so a failed save (`ENOSPC`, `EACCES`)
+or interrupted commit leaves the previous usable config and token intact; the
+new token is at worst an orphan. A postcommit failure to remove the pending
+identity file is reported as committed success, not as a rolled-back
+transaction. Rollback therefore only needs the previous config (whose
+`tokenSecretId` still points at the untouched old key); no raw-secret backup
+file exists.
 
 ### Import behavior and quiescence
 
@@ -267,31 +277,58 @@ the same bot.
 ### Status, start and disable safety
 
 ```sh
-feishu-codex-bridge fleet relay status
-feishu-codex-bridge start          # or foreground: feishu-codex-bridge run
+node bin/feishu-codex-bridge.mjs fleet relay status
+node bin/feishu-codex-bridge.mjs start  # foreground: node bin/feishu-codex-bridge.mjs run
 ```
 
-Status prints transport, sanitized relay URL, enabled/name/node ID and config
-path; it never prints the token value or secret reference.
+General `fleet status` prints `transport` plus the sanitized relay URL for a
+relay config (and no fictitious Bitable poll interval); `fleet relay status`
+prints enabled/name/node ID/config path. Neither prints the token value or
+secret reference, and an invalid URL is shown as a fixed marker rather than an
+arbitrary path that could contain a token.
 
 A relay worker opens **no Feishu event WebSocket**. The SDK is constructed with
 the supported webhook lifecycle only to fetch bot identity/register handlers;
 outbound replies and the native CLI/orchestrator/API sender remain available.
 
 At login a transient relay outage leaves the daemon reconnect-pending instead
-of exiting. After readiness the worker migrates/publishes/syncs, activates,
-then drains. After reconnect it republishes/syncs and drains again. Auth,
-protocol-version and different-host identity failures are terminal and are
-surfaced without falling back to Bitable or a local Feishu WS. Mutations whose
-response was lost are unknown and are never replayed automatically.
+of exiting. The true startup order is:
+
+1. connect the relay socket and receive `ready` (inactive);
+2. validate home, migrate local ownership, publish the signed node and sync
+   project bindings;
+3. invoke the runtime readiness callback exactly once, which activates the
+   worker;
+4. only then drain pending commands and schedule heartbeats.
+
+On reconnect the client emits `reconnected` while still inactive; the retained
+runtime callback republishes/syncs, activates, and only then drains. A
+`quit`/stop during any of these awaits cancels the chain; no later activation,
+command claim or timer resurrection occurs. Auth, protocol-version and
+different-host identity failures are terminal and are surfaced without falling
+back to Bitable or a local Feishu WS. Mutations whose response was lost are
+unknown and are never replayed automatically; reads may be retried safely.
 
 ```sh
-feishu-codex-bridge fleet relay disable
+node bin/feishu-codex-bridge.mjs fleet relay disable
 ```
 
 Disabling in relay mode refuses unsafe local-WS restoration: it stops routing
 immediately, and a later `start` fails closed with a clear error rather than
 opening a local Feishu event socket while a cloud gateway may own the events.
-The command never disables the cloud gateway remotely. To roll back after the
-gateway is explicitly disabled, restore the backed-up prior config/token (or
-re-run the legacy Bitable setup) and only then start the old receiver.
+`fleet relay disable` refuses to mutate a Bitable/no-fleet configuration; the
+ordinary `fleet disable` remains the Bitable command. The relay command never
+disables the cloud gateway remotely. To roll back after the gateway is
+explicitly disabled, restore the prior config (the untouched old token key is
+still valid) or re-run the legacy Bitable setup, and only then start the old
+receiver.
+
+## Reproducible process acceptance
+
+From the built source checkout, run `npm run test:relay-process`. It starts the
+standalone bundle and production receiver in separate local Node processes,
+checks original message/card fields, server reconnect and durable inbox replay
+suppression, then removes only its own temporary data. CI runs it on Windows,
+macOS and Linux. This verifies local loopback WS, not public WSS/TLS or real
+Feishu delivery. Use `node bin/feishu-codex-bridge.mjs` from this checkout for
+worker maintenance; an older global CLI may point at another installation.
