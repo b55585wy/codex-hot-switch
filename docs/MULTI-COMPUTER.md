@@ -4,6 +4,14 @@
 
 默认关闭。没有 `fleet.enabled: true` 的配置继续走原单机流程。先在独立测试机器人下验证两台电脑，再切换已有机器人；同一个机器人不能混接未升级的旧实例。
 
+保留单机模式时，仍可在每台电脑分别配置不同 App ID 的机器人。多电脑模式使用持久设备 ID 确认归属，电脑显示名和群名只用于展示；项目按 `App ID + chatId` 找到设备，再由设备解析本机 `cwd`。原 `projects.json`、`sessions.json` 仍按机器人保存在本机 `~/.feishu-codex-bridge/bots/<appId>/` 下。
+
+## 为什么需要共享控制面
+
+同一应用的飞书长连接会把一条事件交给其中一个在线客户端，不会按群名选择电脑，见 [飞书官方长连接说明](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)。仅修改群名或 `allowedChats` 无法转交事件，因此每个实例都先查询归属，再在本机执行或写入目标电脑的共享队列。
+
+本实现参考 [Agent Session Center 的多电脑方案](https://github.com/fatedawn/agent-session-center/tree/v1.0.17) 使用飞书多维表格承载目录和指令的思路，保留 Bridge 原有处理链、项目和会话结构。它不依赖一台常驻自建云服务器；转交延迟受轮询间隔影响，电脑离线时不会自动转移计算。
+
 ## 准备
 
 - 两台电脑均安装 Node.js 24 或更新版本，本机 Codex 已安装、登录并能正常执行任务。
