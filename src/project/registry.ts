@@ -2,10 +2,13 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
+import { fleetNodeId } from '../fleet/context';
 import type { PermissionMode, ReasoningEffort } from '../agent/types';
 
 /** A project = a Feishu group bound to a fixed working directory. */
 export interface Project {
+  /** Fixed execution computer when multi-computer routing is enabled. */
+  ownerNodeId?: string;
   /** unique project name (also the group name) */
   name: string;
   /** the bound Feishu group chat_id (oc_xxx) */
@@ -193,7 +196,8 @@ export async function addProject(p: Project): Promise<void> {
       const bound = projects.find((x) => x.chatId === p.chatId);
       if (bound) throw new Error(`该群已绑定为项目「${bound.name}」`);
     }
-    projects.push(p);
+    const nodeId = fleetNodeId();
+    projects.push(nodeId && !p.ownerNodeId ? { ...p, ownerNodeId: nodeId } : p);
     await write(projects);
   });
 }

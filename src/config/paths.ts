@@ -50,6 +50,7 @@ export function botPaths(appId: string): {
 
 export const paths = {
   appDir,
+  get fleetDir(): string { return join(currentBotDir, 'fleet'); },
   cacheDir: appDir,
   /** bot 注册表：保存的全部 bot + 当前选中的 appId */
   botsFile: join(appDir, 'bots.json'),

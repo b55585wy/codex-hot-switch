@@ -9,6 +9,7 @@ import { runWeb } from './commands/web';
 import { runDaemonControl } from './commands/daemon-control';
 import { runWinRelaunch } from '../service/win-startup';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
+import { runFleetSetup, runFleetStatus, runFleetDisable } from './commands/fleet';
 
 const program = new Command();
 
@@ -123,6 +124,19 @@ bot
   });
 
 // ── 杂项 ─────────────────────────────────────────────────────
+const fleet = program.command('fleet').description('多电脑接入（默认关闭，各机独立执行）');
+fleet.command('setup').description('配置同一机器人和共享表，注册当前电脑；需先停止本机后台')
+  .requiredOption('--name <name>', '本机显示名称')
+  .requiredOption('--base <url>', '共享飞书多维表格链接或 app token')
+  .option('--app-id <id>', '新电脑复用已有机器人的 App ID')
+  .option('--owner <openId>', '新电脑管理员 open_id')
+  .option('--tenant <tenant>', 'feishu 或 lark')
+  .option('--secret-stdin', '从标准输入读取 App Secret，避免出现在命令历史中')
+  .option('--poll-ms <ms>', '轮询间隔 5000–60000 毫秒，默认 15000')
+  .action(runFleetSetup);
+fleet.command('status').description('查看本机多电脑配置，不输出密钥').action(runFleetStatus);
+fleet.command('disable').description('停用本机多电脑配置；需先停止后台').action(runFleetDisable);
+
 program
   .command('doctor')
   .description('本地自检：codex / 登录 / lark-cli / 当前机器人配置')

@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
+import { fleetNodeId } from '../fleet/context';
 import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
 
 /**
@@ -11,6 +12,8 @@ import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
  * model/effort overrides stick.
  */
 export interface SessionRecord {
+  /** Physical computer owning the local backend/session files. */
+  ownerNodeId?: string;
   /** Feishu topic thread_id (the key) */
   threadId: string;
   chatId: string;
@@ -185,6 +188,8 @@ export async function getSession(threadId: string): Promise<SessionRecord | unde
 /** Insert or replace a session by threadId. */
 export async function upsertSession(rec: SessionRecord): Promise<void> {
   return withLock(async () => {
+    const nodeId = fleetNodeId();
+    if (nodeId && !rec.ownerNodeId) rec = { ...rec, ownerNodeId: nodeId };
     const store = await read();
     const idx = store.sessions.findIndex((s) => s.threadId === rec.threadId);
     if (idx === -1) store.sessions.push(rec);

@@ -1,4 +1,5 @@
 import { REASONING_EFFORTS, type ReasoningEffort } from '../agent/types';
+import type { FleetConfig } from '../fleet/model';
 
 export type TenantBrand = 'feishu' | 'lark';
 
@@ -173,6 +174,8 @@ export interface CommentsConfig {
 }
 
 export interface AppConfig {
+  /** Opt-in routing; absent/disabled preserves the existing single-computer flow. */
+  fleet?: FleetConfig;
   accounts: {
     app: AppCredentials;
   };
