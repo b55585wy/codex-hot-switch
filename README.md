@@ -2,6 +2,8 @@
 
 本仓库新增 **多终端 Codex 账号热切换与飞书原生菜单**。安装、启动和验收说明见 [HOT-SWITCH.md](HOT-SWITCH.md)；飞书私聊可用 `/runtime` 查询账号、`/runtime usage` 查询额度、`/runtime switch <账号>` 切号。
 
+Windows 本地运行、登录自启动和手动恢复见 [Windows 启动说明](docs/WINDOWS-STARTUP.md)。
+
 Bridge 自建项目群现在自动安装 **会话 / 操作 / 帮助** 菜单，已有自建群在启动后补装。控制卡按用户选择原会话，提供继续、停止当前轮次、设置目标及结束目标并停止；多话题群先选会话，外部群结构不会自动修改。使用与权限边界见 [群会话控制说明](docs/GROUP-CONTROLS.md)，命令入口为 `/controls`，管理员修复入口为 `/controls setup`。
 
 在飞书里管理长期负责某个模块的 Codex 会话：运行中保持安静，完成后把结果发回对应话题；你也可以发截图验收要求，再回复修改意见或确认通过。
