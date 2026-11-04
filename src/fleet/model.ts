@@ -5,6 +5,16 @@ export const ONLINE_MS = 90_000;
 export const COMMAND_TTL_MS = 10 * 60_000;
 export const MAX_EVENT_BYTES = 48 * 1024;
 
+export type FleetTransport = 'bitable' | 'relay';
+export interface FleetRelayConfig {
+  /** ws:// on loopback, or wss:// for any host. Never carries a token. */
+  url: string;
+  /** Native encrypted-keystore reference; never the token itself. */
+  tokenSecretId: string;
+  /** Optional local HTTP(S) proxy for the relay socket only. */
+  proxyUrl?: string;
+}
+
 export interface FleetConfig {
   enabled: boolean;
   nodeId: string;
@@ -12,15 +22,22 @@ export interface FleetConfig {
   appToken: string;
   tables: { nodes: string; routes: string; commands: string };
   pollMs?: number;
+  /** Absent retains the legacy Bitable transport. */
+  transport?: FleetTransport;
+  /** Required when transport is 'relay'. */
+  relay?: FleetRelayConfig;
   /** Optional local transport for the fleet/shared-Bitable SDK client only. */
   apiProxyUrl?: string;
 }
+export type FleetNodeKind = 'worker' | 'gateway';
 export interface FleetNode {
   id: string;
   name: string;
   protocol: number;
   seenAt: number;
   host: string;
+  /** Absent means a legacy worker. Gateways are never selectable/executable. */
+  kind?: FleetNodeKind;
 }
 export type FleetKind = 'message' | 'cardAction' | 'reaction' | 'comment' | 'botAdded' | 'botRemoved' | 'botMenu';
 export interface FleetEvent { kind: FleetKind; data: Record<string, unknown> }
@@ -35,11 +52,20 @@ export interface FleetCommand {
 }
 export type FleetTable = 'nodes' | 'routes' | 'commands';
 export interface StoredValue { key: string; value: string; target?: string; expiresAt?: number }
+export type FleetStorageNotice = { type: 'commands'; target: string }
+  | { type: 'presence' } | { type: 'reconnected' };
 export interface FleetStorage {
   get(table: FleetTable, key: string): Promise<StoredValue | undefined>;
   list(table: FleetTable, target?: string): Promise<StoredValue[]>;
   put(table: FleetTable, row: StoredValue): Promise<void>;
   remove(table: FleetTable, key: string): Promise<void>;
+  connect?(): Promise<void>;
+  subscribe?(listener: (notice: FleetStorageNotice) => void): () => void;
+  isNodeConnected?(nodeId: string): boolean;
+  compareAndSwap?(table: FleetTable, row: StoredValue, expectedValue: string | null): Promise<boolean>;
+  /** Cheap fail-closed health for /healthz; must not expose paths or payloads. */
+  health?(): { ok: boolean };
+  close?(): Promise<void>;
 }
 
 export function canonical(value: unknown): string {
@@ -89,6 +115,38 @@ export class SignedFleetStore {
     const payload = { value, proof: this.proof({ table, key, value }) };
     await this.storage.put(table, { key, value: canonical(payload), target, expiresAt });
   }
+
+  /** Encodes a signed row exactly as put() would, for deterministic CAS. */
+  encode(table: FleetTable, key: string, value: unknown, target?: string, expiresAt?: number): StoredValue {
+    return { key, value: canonical({ value, proof: this.proof({ table, key, value }) }), target, expiresAt };
+  }
+
+  /**
+   * Atomic update against the observed decoded value. A legacy store without
+   * CAS keeps the historical non-atomic put behavior.
+   */
+  async putIfUnchanged(
+    table: FleetTable, key: string, previousValue: unknown | undefined, nextValue: unknown,
+    target?: string, expiresAt?: number,
+  ): Promise<boolean> {
+    const next = this.encode(table, key, nextValue, target, expiresAt);
+    if (!this.storage.compareAndSwap) {
+      await this.storage.put(table, next);
+      return true;
+    }
+    const expected = previousValue === undefined ? null : this.encode(table, key, previousValue).value;
+    return this.storage.compareAndSwap(table, next, expected);
+  }
+}
+
+/** Absent kind keeps legacy worker semantics. */
+export function fleetNodeKind(node: Pick<FleetNode, 'kind'> | undefined): FleetNodeKind {
+  return node?.kind === 'gateway' ? 'gateway' : 'worker';
+}
+
+/** Picker/selection view: only signed worker nodes are executable destinations. */
+export function selectableFleetNodes(nodes: FleetNode[]): FleetNode[] {
+  return nodes.filter(node => fleetNodeKind(node) === 'worker');
 }
 
 export function eventActor(event: FleetEvent): string {
@@ -156,12 +214,42 @@ export function validateFleetApiProxyUrl(value: string): void {
   }
 }
 
+export function validateFleetRelayUrl(value: string): void {
+  if (typeof value !== 'string' || !value || value !== value.trim()
+    || /[\u0000-\u001f\u007f\s]/.test(value)) {
+    throw new Error('中继地址无效：请填写不含空白或控制字符的 WebSocket URL');
+  }
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw new Error('中继地址无效：请填写完整的 WebSocket URL'); }
+  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') throw new Error('中继地址仅支持 ws:// 或 wss://');
+  if (!parsed.hostname) throw new Error('中继地址缺少主机名');
+  if (parsed.username || parsed.password) throw new Error('中继地址不能包含用户名或密码');
+  if (parsed.search || parsed.hash) throw new Error('中继地址不能包含查询参数或片段');
+  if (parsed.protocol === 'ws:') {
+    const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (!(host === 'localhost' || host === '::1' || host === '127.0.0.1'
+      || /^127\./.test(host))) throw new Error('公网中继必须使用 wss://；明文 ws:// 仅允许本机回环地址');
+  }
+}
+
 export function validateFleetConfig(cfg: FleetConfig): void {
   if (!/^[a-f0-9-]{36}$/i.test(cfg.nodeId)) throw new Error('多电脑配置缺少有效设备 ID');
   if (!cfg.name?.trim() || cfg.name.length > 32) throw new Error('电脑名应为 1–32 个字符');
-  if (!/^[a-zA-Z0-9]+$/.test(cfg.appToken)) throw new Error('多维表格 app token 无效');
-  if (!cfg.tables || !(['nodes', 'routes', 'commands'] as const).every(key => /^tbl[a-zA-Z0-9]+$/.test(cfg.tables[key] ?? ''))) {
-    throw new Error('多电脑配置缺少有效数据表 ID');
+  if (cfg.transport !== undefined && cfg.transport !== 'bitable' && cfg.transport !== 'relay') {
+    throw new Error('多电脑传输模式无效');
+  }
+  if (cfg.transport === 'relay') {
+    if (!cfg.relay) throw new Error('中继模式缺少中继配置');
+    validateFleetRelayUrl(cfg.relay.url);
+    if (typeof cfg.relay.tokenSecretId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(cfg.relay.tokenSecretId)) {
+      throw new Error('中继令牌引用无效');
+    }
+    if (cfg.relay.proxyUrl !== undefined) validateFleetApiProxyUrl(cfg.relay.proxyUrl);
+  } else {
+    if (!/^[a-zA-Z0-9]+$/.test(cfg.appToken)) throw new Error('多维表格 app token 无效');
+    if (!cfg.tables || !(['nodes', 'routes', 'commands'] as const).every(key => /^tbl[a-zA-Z0-9]+$/.test(cfg.tables[key] ?? ''))) {
+      throw new Error('多电脑配置缺少有效数据表 ID');
+    }
   }
   if (cfg.pollMs !== undefined && (!Number.isFinite(cfg.pollMs) || cfg.pollMs < 5_000 || cfg.pollMs > 60_000)) {
     throw new Error('多电脑轮询间隔必须在 5–60 秒之间');

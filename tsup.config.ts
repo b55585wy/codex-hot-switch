@@ -29,4 +29,17 @@ export default defineConfig([
     dts: true,
     external,
   },
+  {
+    // Portable cloud relay: one CJS file that needs Node 24 only (no npm install).
+    entry: { 'relay-server': 'src/fleet/relay/cli.ts' },
+    outDir: 'dist',
+    format: ['cjs'],
+    target: 'node24',
+    platform: 'node',
+    sourcemap: false,
+    splitting: false,
+    dts: false,
+    clean: false,
+    noExternal: [/.*/],
+  },
 ]);

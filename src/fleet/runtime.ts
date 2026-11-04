@@ -3,9 +3,15 @@ import { isAdmin, isChatAllowed, isUserAllowedInProject } from '../config/schema
 import { defaultNoMention, type Project } from '../project/registry';
 import { FleetInbox } from './inbox';
 import { COMMAND_TTL_MS, FLEET_PROTOCOL, SignedFleetStore, commandId, isOnline,
-  canonical, validEvent, eventActor, type FleetCommand, type FleetConfig, type FleetEvent, type FleetNode } from './model';
+  canonical, fleetNodeKind, selectableFleetNodes, validEvent, eventActor,
+  type FleetCommand, type FleetConfig, type FleetEvent, type FleetNode, type FleetNodeKind,
+  type FleetStorageNotice } from './model';
 
 interface Route { nodeId: string; noMention?: boolean; groupKind?: 'single' | 'multi' }
+const RELAY_HEARTBEAT_MS = 15_000;
+const RELAY_DRAIN_LIMIT = 16;
+const RELAY_SHUTDOWN_DRAIN_MS = 5_000;
+const RELAY_OFFLINE_PUBLISH_MS = 2_000;
 export class FleetDeliveryUnknown extends Error {
   constructor() { super('指令投递回执未确认，未自动重试；请先查看目标电脑状态，再决定是否重新提交。'); }
 }
@@ -23,71 +29,238 @@ export interface FleetRuntimeOptions {
   picker: (event: FleetEvent, nodes: FleetNode[]) => Promise<void>;
   onError: (error: unknown) => void;
   now?: () => number;
+  /** Gateway processes forward events but never consume or execute commands. */
+  kind?: FleetNodeKind;
 }
 
 export class FleetRuntime {
   private timer?: ReturnType<typeof setTimeout>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
   private ticking?: Promise<void>;
+  private heartbeat?: Promise<void>;
+  private readonly publishes = new Set<Promise<void>>();
   private lastHeartbeat = 0;
   private lastBindings = 0;
   private readonly messageQueues = new Map<string, Promise<void>>();
+  private readonly active = new Map<string, Promise<void>>();
   private readonly now: () => number;
+  private readonly kind: FleetNodeKind;
+  private readonly relayMode: boolean;
+  private unsubscribe?: () => void;
+  private pendingWake = false;
+  private ready = false;
   private stopped = false;
   private idleTicks = 0;
 
   constructor(private readonly options: FleetRuntimeOptions) {
     this.now = options.now ?? Date.now;
+    this.kind = options.kind ?? 'worker';
+    this.relayMode = options.config.transport === 'relay';
   }
 
   get nodeId(): string { return this.options.config.nodeId; }
   get store(): SignedFleetStore { return this.options.store; }
+  get nodeKind(): FleetNodeKind { return this.kind; }
+
+  private track(task: Promise<void>): Promise<void> {
+    this.publishes.add(task);
+    void task.catch(() => undefined).finally(() => { this.publishes.delete(task); });
+    return task;
+  }
+
+  private heartbeatOnce(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.heartbeat) return this.heartbeat;
+    const run = this.track(this.publishNode().catch(this.options.onError)).finally(() => {
+      if (this.heartbeat === run) this.heartbeat = undefined;
+    });
+    this.heartbeat = run;
+    return run;
+  }
 
   async start(): Promise<void> {
-    if (!await this.store.get<Route>('routes', 'home')) throw new Error('共享目录未初始化，请先运行 fleet setup');
-    await this.options.migrate(this.nodeId);
-    await this.tick();
+    if (this.relayMode) {
+      await this.store.storage.connect?.();
+      if (this.stopped) return;
+      this.unsubscribe = this.store.storage.subscribe?.(notice => this.onNotice(notice));
+    }
+    const home = await this.store.get<Route>('routes', 'home');
+    if (this.stopped) return;
+    if (!home && this.kind !== 'gateway') throw new Error('共享目录未初始化，请先运行 fleet setup');
+    if (this.kind !== 'gateway') {
+      await this.options.migrate(this.nodeId);
+      if (this.stopped) return;
+    }
+    // Validate/publish local node ownership BEFORE consuming any pending
+    // command, so a copied identity can never execute and then fail startup.
+    if (this.relayMode) await this.track(this.publishNode());
+    if (this.stopped) return;
+    try {
+      await this.tick();
+    } catch (error) {
+      // A failed explicit startup must not leave a background poll chain.
+      if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+      throw error;
+    }
+    if (this.stopped) return;
+    // Notices may have arrived during connect/home/migrate/publish; they are
+    // retained and only drained now that ownership has been validated.
+    this.ready = true;
+    if (this.pendingWake) {
+      this.pendingWake = false;
+      try {
+        await this.tick();
+      } catch (error) {
+        if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+        throw error;
+      }
+      if (this.stopped) return;
+    }
     this.schedule();
+    if (this.relayMode && !this.stopped) {
+      this.heartbeatTimer = setInterval(() => { void this.heartbeatOnce(); }, RELAY_HEARTBEAT_MS);
+      this.heartbeatTimer.unref();
+    }
   }
 
   private schedule(): void {
-    if (this.stopped) return;
-    const delay = Math.min(60_000, (this.options.config.pollMs ?? 15_000) * (1 + Math.floor(this.idleTicks / 4)));
+    if (this.stopped || this.ticking) return;
+    const base = this.relayMode ? Math.min(5_000, this.options.config.pollMs ?? 5_000)
+      : (this.options.config.pollMs ?? 15_000);
+    const delay = this.relayMode ? base
+      : Math.min(60_000, base * (1 + Math.floor(this.idleTicks / 4)));
+    if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
-      void this.tick().catch(this.options.onError).finally(() => this.schedule());
+      this.timer = undefined;
+      void this.tick().catch(this.options.onError);
     }, delay);
     this.timer.unref();
   }
 
+  private onNotice(notice: FleetStorageNotice): void {
+    if (this.stopped) return;
+    if (notice.type === 'commands' && notice.target !== this.nodeId) return;
+    // Startup owns no validated node identity yet. Never wake/tick from an
+    // external notice until readiness; retain one coalesced pending wake.
+    if (!this.ready) { this.pendingWake = true; return; }
+    if (notice.type === 'reconnected') {
+      const task = (async () => {
+        await this.publishNode();
+        if (this.stopped) return;
+        await this.syncProjects();
+        if (this.stopped) return;
+        this.wake();
+      })();
+      void this.track(task).catch(this.options.onError);
+      return;
+    }
+    this.wake();
+  }
+
+  /** Coalesces push notices; a wake during an in-flight tick is never lost. */
+  private wake(): void {
+    if (this.stopped) return;
+    this.pendingWake = true;
+    if (!this.ready || this.ticking) return;
+    this.pendingWake = false;
+    void this.tick().catch(this.options.onError);
+  }
+
   async shutdown(): Promise<void> {
     this.stop();
-    if (this.ticking) {
+    const pending: Promise<unknown>[] = [];
+    if (this.heartbeat) pending.push(this.heartbeat);
+    if (this.publishes.size) pending.push(...this.publishes);
+    if (this.ticking) pending.push(this.ticking);
+    if (pending.length) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([this.ticking.catch(this.options.onError), new Promise<void>(done => {
-        timer = setTimeout(done, 5000); timer.unref();
-      })]).finally(() => { if (timer) clearTimeout(timer); });
+      await Promise.race([Promise.allSettled(pending).then(() => undefined),
+        new Promise<void>(done => { timer = setTimeout(done, 5_000); timer.unref(); })])
+        .finally(() => { if (timer) clearTimeout(timer); });
     }
-    await this.publishNode(0).catch(this.options.onError);
+    if (this.relayMode && this.kind === 'worker' && this.active.size) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const drains = [...this.active.values()];
+      await Promise.race([Promise.allSettled(drains).then(() => undefined),
+        new Promise<void>(done => { timer = setTimeout(done, RELAY_SHUTDOWN_DRAIN_MS); timer.unref(); })])
+        .finally(() => { if (timer) clearTimeout(timer); });
+    }
+    // Offline publication is last; older in-flight online publishes were
+    // awaited. It is bounded so a stalled caller transport cannot hang stop;
+    // any online publish that resumes after stop fails closed without writing.
+    let offlineTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.publishNode(0).catch(this.options.onError),
+      new Promise<void>(done => { offlineTimer = setTimeout(done, RELAY_OFFLINE_PUBLISH_MS); offlineTimer.unref(); }),
+    ]).finally(() => { if (offlineTimer) clearTimeout(offlineTimer); });
   }
 
   stop(): void {
     this.stopped = true;
+    this.ready = false;
     if (this.timer) clearTimeout(this.timer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
   }
 
   async publishNode(seenAt = this.now()): Promise<void> {
     const { config, host } = this.options;
     const old = await this.store.get<FleetNode>('nodes', this.nodeId);
-    if (old && old.host !== host && isOnline(old, this.now())) throw new Error('设备 ID 被另一台在线电脑使用，请重新配置本机身份');
-    await this.store.put('nodes', this.nodeId, { id: this.nodeId, name: config.name,
-      protocol: FLEET_PROTOCOL, seenAt, host } satisfies FleetNode);
+    // Stop can happen during the awaited prior-node read. An online publish
+    // must never resurrect presence after stop; the explicit offline publish
+    // (seenAt=0) is still allowed.
+    if (seenAt !== 0 && this.stopped) return;
+    if (this.kind === 'worker' && old && old.host !== host && isOnline(old, this.now())) {
+      throw new Error('设备 ID 被另一台在线电脑使用，请重新配置本机身份');
+    }
+    const node: FleetNode = { id: this.nodeId, name: config.name, protocol: FLEET_PROTOCOL, seenAt, host,
+      ...(this.kind === 'gateway' ? { kind: 'gateway' as const } : {}) };
+    await this.store.put('nodes', this.nodeId, node);
     this.lastHeartbeat = this.now();
   }
 
+  /** Signed nodes with a computed offline overlay; stored bodies are never rewritten. */
+  private async nodeView(): Promise<FleetNode[]> {
+    const nodes = await this.store.list<FleetNode>('nodes');
+    const connected = this.store.storage.isNodeConnected?.bind(this.store.storage);
+    if (!connected) return nodes;
+    return nodes.map(node => connected(node.id) ? node : { ...node, seenAt: 0 });
+  }
+
+  private async visibleNode(nodeId: string): Promise<FleetNode | undefined> {
+    const node = await this.store.get<FleetNode>('nodes', nodeId);
+    if (!node) return undefined;
+    const connected = this.store.storage.isNodeConnected?.bind(this.store.storage);
+    return connected && !connected(nodeId) ? { ...node, seenAt: 0 } : node;
+  }
+
+  /** First-home initialization uses the observed signed value; never blind replace. */
+  async initializeHome(nodeId = this.nodeId): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const old = await this.store.get<Route>('routes', 'home');
+      if (old) {
+        // A new worker joining an established fleet accepts the existing valid
+        // home without overwriting it.
+        if (typeof old.nodeId === 'string' && old.nodeId) return;
+        throw new Error('共享目录归属记录无效，未自动覆盖');
+      }
+      if (await this.store.putIfUnchanged('routes', 'home', undefined, { nodeId } satisfies Route)) return;
+    }
+    const current = await this.store.get<Route>('routes', 'home');
+    if (current && typeof current.nodeId === 'string' && current.nodeId) return;
+    throw new Error('共享目录初始化发生并发冲突，请重试');
+  }
+
   async bindRoute(key: string, nodeId = this.nodeId, replace = false): Promise<void> {
-    const old = await this.store.get<Route>('routes', key);
-    if (old && old.nodeId !== nodeId && !replace) throw new Error('项目或会话已属于另一台电脑，未自动改绑');
-    if (old?.nodeId === nodeId) return;
-    await this.store.put('routes', key, { nodeId } satisfies Route);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const old = await this.store.get<Route>('routes', key);
+      if (old?.nodeId === nodeId) return;
+      if (old && old.nodeId !== nodeId && !replace) throw new Error('项目或会话已属于另一台电脑，未自动改绑');
+      if (await this.store.putIfUnchanged('routes', key, old, { nodeId } satisfies Route)) return;
+    }
+    throw new Error('项目或会话归属发生并发冲突，未自动改绑');
   }
 
   async ownMessage(messageId: string): Promise<void> {
@@ -98,10 +271,14 @@ export class FleetRuntime {
     for (const project of await this.options.projects()) {
       if (project.ownerNodeId && project.ownerNodeId !== this.nodeId) continue;
       const key = `project:${project.chatId}`;
-      const old = await this.store.get<Route>('routes', key);
-      if (old && old.nodeId !== this.nodeId) throw new Error('项目已属于另一台电脑，未自动改绑');
       const value: Route = { nodeId: this.nodeId, noMention: project.noMention ?? defaultNoMention(project), groupKind: project.kind ?? 'multi' };
-      if (canonical(old) !== canonical(value)) await this.store.put('routes', key, value);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const old = await this.store.get<Route>('routes', key);
+        if (old && old.nodeId !== this.nodeId) throw new Error('项目已属于另一台电脑，未自动改绑');
+        if (canonical(old) === canonical(value)) break;
+        if (await this.store.putIfUnchanged('routes', key, old, value)) break;
+        if (attempt === 1) throw new Error('项目归属发生并发冲突，未自动改绑');
+      }
     }
     for (const key of await this.options.extraRoutes?.() ?? []) await this.bindRoute(key);
     this.lastBindings = this.now();
@@ -110,17 +287,65 @@ export class FleetRuntime {
   tick(): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.ticking) return this.ticking;
-    this.ticking = this.poll().finally(() => { this.ticking = undefined; });
-    return this.ticking;
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    const run = this.poll();
+    const holder: { owned?: Promise<void> } = {};
+    // One completion owner: clear the in-flight marker, then either coalesce a
+    // retained wake or reschedule. Explicit callers still observe rejection;
+    // background callers attach onError at their call site.
+    const owned = run.then(
+      () => { this.finishTick(holder.owned!); },
+      error => { this.finishTick(holder.owned!); throw error; },
+    );
+    holder.owned = owned;
+    this.ticking = owned;
+    return owned;
+  }
+
+  private finishTick(owned: Promise<void>): void {
+    if (this.ticking === owned) this.ticking = undefined;
+    if (this.stopped) return;
+    if (this.pendingWake) {
+      this.pendingWake = false;
+      void this.tick().catch(this.options.onError);
+    } else this.schedule();
   }
 
   private async poll(): Promise<void> {
-    if (!this.lastHeartbeat || this.now() - this.lastHeartbeat >= 30_000) await this.publishNode();
+    if (!this.relayMode && (!this.lastHeartbeat || this.now() - this.lastHeartbeat >= 30_000)) {
+      await this.publishNode();
+    }
     if (!this.lastBindings || this.now() - this.lastBindings >= 30_000) await this.syncProjects();
+    if (this.kind === 'gateway') {
+      // Gateway presence is published by the independent heartbeat; it never drains commands.
+      this.idleTicks = 0;
+      return;
+    }
     const commands = await this.store.list<FleetCommand>('commands', this.nodeId);
     this.idleTicks = commands.length ? 0 : this.idleTicks + 1;
-    const ordered = commands.sort((a, b) => a.createdAt - b.createdAt).slice(0, 10);
-    await Promise.all(ordered.map(command => this.consume(command).catch(this.options.onError)));
+    const ordered = commands.sort((a, b) => a.createdAt - b.createdAt)
+      .filter(command => !this.active.has(command.id)).slice(0, 10);
+    if (!this.relayMode) {
+      await Promise.all(ordered.map(command => this.consume(command).catch(this.options.onError)));
+      return;
+    }
+    for (const command of ordered) {
+      if (this.active.size >= RELAY_DRAIN_LIMIT) break;
+      this.dispatchControl(command);
+    }
+  }
+
+  /** Relay control work is bounded and independent from handler/model completion. */
+  private dispatchControl(command: FleetCommand): void {
+    if (this.stopped || !command?.id || this.active.has(command.id)) return;
+    const pending = this.consume(command).catch(this.options.onError).finally(() => {
+      this.active.delete(command.id);
+      if (this.pendingWake && !this.stopped) {
+        this.pendingWake = false;
+        this.wake();
+      }
+    });
+    this.active.set(command.id, pending);
   }
 
   async receive(event: FleetEvent): Promise<void> {
@@ -165,7 +390,15 @@ export class FleetRuntime {
   }
 
   private async send(event: FleetEvent, target: string): Promise<void> {
-    const node = await this.store.get<FleetNode>('nodes', target);
+    if (target === this.nodeId && this.kind === 'gateway') {
+      await this.options.reply(event, '中继网关不是执行电脑，未在本机执行。请选择一台在线电脑。');
+      return;
+    }
+    const node = await this.visibleNode(target);
+    if (node && fleetNodeKind(node) === 'gateway') {
+      await this.options.reply(event, `「${node.name}」是中继网关，不是执行电脑，未执行。请选择一台在线电脑。`);
+      return;
+    }
     if (!node || !isOnline(node, this.now())) {
       await this.options.reply(event, `电脑「${node?.name ?? target}」离线或版本不兼容，未在其他电脑执行。`);
       return;
@@ -254,7 +487,7 @@ export class FleetRuntime {
   }
 
   private async select(event: FleetEvent, query: string): Promise<void> {
-    const nodes = await this.store.list<FleetNode>('nodes');
+    const nodes = selectableFleetNodes(await this.nodeView());
     const matches = nodes.filter(n => n.id === query || n.name.toLocaleLowerCase() === query.toLocaleLowerCase());
     if (matches.length !== 1) throw new Error(matches.length ? '电脑名重复，请使用完整设备 ID' : '没有找到该电脑');
     const node = matches[0]!;
@@ -273,13 +506,16 @@ export class FleetRuntime {
       && !isChatAllowed(this.options.cfg, String(event.data.chatId))) throw new Error('此会话未获授权');
     if (action) { await this.select(event, String(action.targetNodeId ?? '')); return true; }
     const query = match?.[1]?.trim();
-    if (!query) { await this.options.picker(event, await this.store.list<FleetNode>('nodes')); return true; }
+    if (!query) {
+      await this.options.picker(event, selectableFleetNodes(await this.nodeView()));
+      return true;
+    }
     const bind = /^绑定\s+(.+)$/u.exec(query);
     if (bind) {
       if (event.data.chatType !== 'group') throw new Error('请在要绑定的项目群内使用 /电脑 绑定 电脑名');
       const key = `project:${event.data.chatId}`;
       const existing = await this.store.get<Route>('routes', key);
-      const nodes = await this.store.list<FleetNode>('nodes');
+      const nodes = selectableFleetNodes(await this.nodeView());
       const selected = nodes.filter(n => n.id === bind[1] || n.name === bind[1]);
       const target = selected[0];
       if (selected.length !== 1 || !target || !isOnline(target, this.now())) throw new Error('目标电脑不明确或不在线');
