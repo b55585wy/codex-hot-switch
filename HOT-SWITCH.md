@@ -2,6 +2,8 @@
 
 本仓库包含飞书桥完整源码，以及通过 seven332/codex-switch 0.3.2 接入的受管 Codex 账号切换功能。
 
+这里的“多终端”指运行 Bridge 的同一台电脑上的受管终端，不代表已实现跨电脑控制。多台电脑目前应分别配置不同 App ID 的机器人；`/runtime` 及切号命令操作接收命令的 Bridge 所在电脑。共用一个机器人的中转架构尚未实现，详见 [多电脑部署说明](docs/MULTI-COMPUTER.md)。
+
 ## 使用
 
 1. 安装 Node.js 24+、Codex CLI 和 codex-switch 0.3.2。

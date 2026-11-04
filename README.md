@@ -8,6 +8,12 @@ Bridge 自建项目群现在自动安装 **会话 / 操作 / 帮助** 菜单，�
 
 本项目基于 [modelzen/feishu-codex-bridge](https://github.com/modelzen/feishu-codex-bridge) `v0.6.14`，保留完整上游源码，并在构建后应用本仓库的扩展。来源和许可证见 [UPSTREAM.md](UPSTREAM.md)。
 
+## 多台电脑怎么区分
+
+当前可直接使用的方式是 **每台电脑使用独立的飞书机器人（不同 App ID）**，再把项目群命名为 `MacBook｜哈尼网站`、`Windows｜论文实验`。群名方便人辨认；程序根据群的 `chatId` 查找本机项目目录，改群名不会把任务转到另一台电脑。
+
+不要在多台电脑上同时启动同一个 App ID 的 Bridge：飞书长连接会把事件随机交给其中一个客户端，不会按群名选择电脑。当前没有跨电脑设备路由；同一个机器人控制多台电脑需要新增统一中转服务和设备端连接。安装步骤、命令作用范围和待实现的中转设计见 [多电脑部署说明](docs/MULTI-COMPUTER.md)。
+
 ## 在飞书里使用
 
 额度耗尽时，可私聊管理员原生命令 `/account` 查看 CC Switch 已存账号，`/account status` 查询共享后台登录。此入口不调用模型；实际切号需要本仓库提供的 CC Switch 适配版。完整命令、构建步骤和恢复边界见 [原生账号入口](docs/ACCOUNT-CONTROL.md)。
