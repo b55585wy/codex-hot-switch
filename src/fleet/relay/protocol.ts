@@ -73,7 +73,7 @@ function record(value: unknown): Record<string, unknown> {
   }
   return value as Record<string, unknown>;
 }
-function text(value: unknown, max: number, label: string, allowEmpty = false): string {
+function fleetRelayText(value: unknown, max: number, label: string, allowEmpty = false): string {
   if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value)) {
     throw new RelayProtocolError('bad_request', `${label}无效`);
   }
@@ -96,12 +96,12 @@ export function assertTable(value: unknown): asserts value is FleetTable {
 
 export function validateStoredValue(value: unknown): StoredValue {
   const row = record(value);
-  const key = text(row.key, RELAY_KEY_CHARS, '记录键');
+  const key = fleetRelayText(row.key, RELAY_KEY_CHARS, '记录键');
   if (typeof row.value !== 'string') throw new RelayProtocolError('bad_request', '记录内容无效');
   if (byteLength(row.value) > RELAY_ROW_BYTES) throw new RelayProtocolError('too_large', '记录内容超过 128 KiB');
   let target: string | undefined;
   if (row.target !== undefined && row.target !== '') {
-    target = text(row.target, RELAY_TARGET_CHARS, '记录目标');
+    target = fleetRelayText(row.target, RELAY_TARGET_CHARS, '记录目标');
   }
   let expiresAt: number | undefined;
   if (row.expiresAt !== undefined && row.expiresAt !== 0 && row.expiresAt !== null) {
@@ -136,14 +136,14 @@ export function parseHello(value: unknown, appId: string): RelayHello {
   if (typeof msg.nodeId !== 'string' || !NODE_RE.test(msg.nodeId)) {
     throw new RelayProtocolError('bad_request', '设备 ID 无效');
   }
-  const host = text(msg.host, 128, '电脑标识');
+  const host = fleetRelayText(msg.host, 128, '电脑标识');
   return { type: 'hello', version: 1, appId, role: 'worker', nodeId: msg.nodeId.toLowerCase(), host };
 }
 
 export function parseRequest(value: unknown): RelayRequest {
   const msg = record(value);
   if (msg.type !== 'request') throw new RelayProtocolError('bad_request', '需要 request 消息');
-  const id = text(msg.id, 128, '请求 ID');
+  const id = fleetRelayText(msg.id, 128, '请求 ID');
   if (!ID_RE.test(id)) throw new RelayProtocolError('bad_request', '请求 ID 无效');
   const op = msg.op;
   if (typeof op !== 'string' || !(RELAY_OPS as readonly string[]).includes(op)) {
@@ -153,9 +153,9 @@ export function parseRequest(value: unknown): RelayRequest {
   if (op === 'activate') return request;
   if (!isTable(msg.table)) throw new RelayProtocolError('bad_request', '数据表无效');
   request.table = msg.table;
-  if (msg.cursor !== undefined) request.cursor = text(msg.cursor, 512, '分页游标');
-  if (msg.target !== undefined) request.target = text(msg.target, RELAY_TARGET_CHARS, '查询目标');
-  if (op === 'get' || op === 'remove') request.key = text(msg.key, RELAY_KEY_CHARS, '记录键');
+  if (msg.cursor !== undefined) request.cursor = fleetRelayText(msg.cursor, 512, '分页游标');
+  if (msg.target !== undefined) request.target = fleetRelayText(msg.target, RELAY_TARGET_CHARS, '查询目标');
+  if (op === 'get' || op === 'remove') request.key = fleetRelayText(msg.key, RELAY_KEY_CHARS, '记录键');
   if (op === 'list') {
     if (msg.key !== undefined) throw new RelayProtocolError('bad_request', 'list 不接受记录键');
   }

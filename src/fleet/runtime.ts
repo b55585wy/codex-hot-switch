@@ -51,6 +51,9 @@ export class FleetRuntime {
   private ready = false;
   private stopped = false;
   private idleTicks = 0;
+  private startPromise?: Promise<void>;
+  private started = false;
+  private readiness?: () => Promise<void>;
 
   constructor(private readonly options: FleetRuntimeOptions) {
     this.now = options.now ?? Date.now;
@@ -78,7 +81,42 @@ export class FleetRuntime {
     return run;
   }
 
-  async start(): Promise<void> {
+  /**
+   * Starts the runtime. The optional relay readiness callback runs after home
+   * validation, migration, publication and project sync, but before the first
+   * command drain or ready wake. It is retained for every reconnect. Legacy,
+   * gateway and manual tick behaviour is unchanged when no callback is given.
+   *
+   * Startup is idempotent: concurrent/repeat calls share one chain. A failed
+   * partial start removes its subscription/timers so a clean retry is possible;
+   * after a successful start no second chain is created.
+   */
+  async start(beforeConsume?: () => Promise<void>): Promise<void> {
+    if (this.started || this.stopped) return;
+    if (this.startPromise) return this.startPromise;
+    if (beforeConsume) this.readiness = beforeConsume;
+    const task = this.runStart();
+    this.startPromise = task;
+    try {
+      await task;
+      this.started = true;
+    } catch (error) {
+      this.abortStartup();
+      throw error;
+    } finally {
+      if (this.startPromise === task) this.startPromise = undefined;
+    }
+  }
+
+  private abortStartup(): void {
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined; }
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    this.ready = false;
+  }
+
+  private async runStart(): Promise<void> {
     if (this.relayMode) {
       await this.store.storage.connect?.();
       if (this.stopped) return;
@@ -95,25 +133,29 @@ export class FleetRuntime {
     // command, so a copied identity can never execute and then fail startup.
     if (this.relayMode) await this.track(this.publishNode());
     if (this.stopped) return;
+    if (this.relayMode) {
+      // Local authoritative metadata must be complete before activation and
+      // before the first command can be claimed.
+      await this.syncProjects();
+      if (this.stopped) return;
+      if (this.readiness) {
+        await this.readiness();
+        if (this.stopped) return;
+      }
+    }
+    // Notices may have arrived during connect/home/migrate/publish; they are
+    // retained and only drained now that ownership has been validated.
+    this.ready = true;
     try {
       await this.tick();
     } catch (error) {
       // A failed explicit startup must not leave a background poll chain.
-      if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
       throw error;
     }
     if (this.stopped) return;
-    // Notices may have arrived during connect/home/migrate/publish; they are
-    // retained and only drained now that ownership has been validated.
-    this.ready = true;
     if (this.pendingWake) {
       this.pendingWake = false;
-      try {
-        await this.tick();
-      } catch (error) {
-        if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-        throw error;
-      }
+      await this.tick();
       if (this.stopped) return;
     }
     this.schedule();
@@ -149,6 +191,12 @@ export class FleetRuntime {
         if (this.stopped) return;
         await this.syncProjects();
         if (this.stopped) return;
+        // Retained activation hook: publish/sync authoritative state, then
+        // activate the replacement socket before the first drain/wake.
+        if (this.readiness) {
+          await this.readiness();
+          if (this.stopped) return;
+        }
         this.wake();
       })();
       void this.track(task).catch(this.options.onError);
@@ -268,7 +316,10 @@ export class FleetRuntime {
   }
 
   async syncProjects(): Promise<void> {
-    for (const project of await this.options.projects()) {
+    const projects = await this.options.projects();
+    if (this.stopped) return;
+    for (const project of projects) {
+      if (this.stopped) return;
       if (project.ownerNodeId && project.ownerNodeId !== this.nodeId) continue;
       const key = `project:${project.chatId}`;
       const value: Route = { nodeId: this.nodeId, noMention: project.noMention ?? defaultNoMention(project), groupKind: project.kind ?? 'multi' };
@@ -280,7 +331,10 @@ export class FleetRuntime {
         if (attempt === 1) throw new Error('项目归属发生并发冲突，未自动改绑');
       }
     }
-    for (const key of await this.options.extraRoutes?.() ?? []) await this.bindRoute(key);
+    for (const key of await this.options.extraRoutes?.() ?? []) {
+      if (this.stopped) return;
+      await this.bindRoute(key);
+    }
     this.lastBindings = this.now();
   }
 

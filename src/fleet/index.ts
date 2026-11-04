@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 import type { CardActionEvent, CommentEvent, LarkChannel, NormalizedMessage, ReactionEvent } from '@larksuiteoapi/node-sdk';
 import type { AppConfig } from '../config/schema';
 import { paths } from '../config/paths';
+import { getSecret } from '../config/keystore';
 import { listProjects, updateProject } from '../project/registry';
 import { listSessions, patchSession } from '../bot/session-store';
 import type { createOrchestrator } from '../bot/handle-message';
@@ -15,6 +16,8 @@ import { selectFleetApiClient } from './transport';
 import { installFleetHooks } from './hooks';
 import { setFleetNodeId } from './context';
 import { createFleetPicker } from './picker';
+import { FleetRelayClient } from './relay/client';
+import { RelayWorker } from './relay/worker';
 
 type Orchestrator = ReturnType<typeof createOrchestrator>;
 
@@ -44,15 +47,17 @@ export async function existingDocumentRoutes(): Promise<string[]> {
 
 export function createFleetBridge(channel: LarkChannel, cfg: AppConfig, secret: string, handlers: Orchestrator) {
   const config = cfg.fleet;
-  if (!config?.enabled) return undefined;
+  if (!config?.enabled) {
+    // A disabled relay identity must fail closed: silently reverting to a local
+    // Feishu long connection could race an active cloud gateway for events.
+    if (config?.transport === 'relay') {
+      throw new Error('中继模式已停用，拒绝回退到本机飞书长连接；请先确认云端网关已停用并明确恢复原模式');
+    }
+    return undefined;
+  }
   validateFleetConfig(config);
   setFleetNodeId(config.nodeId);
   const onError = (error: unknown): void => log.fail('fleet', error);
-  // The optional local proxy applies only to shared Bitable traffic, never to
-  // the ordinary bot channel or any other Codex/tool HTTP client.
-  const fleetClient = selectFleetApiClient(channel.rawClient, { appId: cfg.accounts.app.id, appSecret: secret,
-    tenant: cfg.accounts.app.tenant, apiProxyUrl: config.apiProxyUrl });
-  const store = new SignedFleetStore(new BitableFleetStorage(fleetClient, config), cfg.accounts.app.id, secret);
   const reply = async (event: FleetEvent, text: string): Promise<void> => {
     const chatId = event.data.chatId;
     if (typeof chatId === 'string' && chatId) {
@@ -73,13 +78,7 @@ export function createFleetBridge(channel: LarkChannel, cfg: AppConfig, secret: 
       case 'botMenu': return handlers.onBotMenu(data as never);
     }
   };
-  const runtime = new FleetRuntime({ config, cfg, host: digest({ host: hostname(), home: paths.appDir }),
-    store, inbox: new FleetInbox(join(paths.fleetDir, 'inbox')), projects: listProjects, extraRoutes: existingDocumentRoutes,
-    migrate: migrateFleetOwnership, dispatch, reply, onError,
-    picker: createFleetPicker(channel),
-  });
-  const restore = installFleetHooks(channel, runtime, config.name, onError);
-  const handle = (kind: FleetEvent['kind'], data: unknown): void => {
+  const handle = (kind: FleetEvent['kind'], data: unknown, runtime: FleetRuntime): void => {
     const event = { kind, data: data as Record<string, unknown> };
     // Return immediately to Feishu; durable handoff may exceed its acknowledgement window.
     void runtime.receive(event).catch(async error => {
@@ -89,8 +88,59 @@ export function createFleetBridge(channel: LarkChannel, cfg: AppConfig, secret: 
       await reply(event, message).catch(onError);
     });
   };
+  const host = digest({ host: hostname(), home: paths.appDir });
+
+  if (config.transport === 'relay') {
+    const relay = config.relay!;
+    const client = new FleetRelayClient({
+      url: relay.url,
+      appId: cfg.accounts.app.id,
+      role: 'worker',
+      nodeId: config.nodeId,
+      host,
+      ...(relay.proxyUrl ? { proxyUrl: relay.proxyUrl } : {}),
+      tokenProvider: () => getSecret(relay.tokenSecretId),
+      // Worker/runtime owns the activation window; reconnect must not activate
+      // before the retained publish/sync readiness callback.
+      autoActivate: false,
+      onFatal: onError,
+    });
+    const store = new SignedFleetStore(client, cfg.accounts.app.id, secret);
+    const runtime = new FleetRuntime({ config, cfg, host, store,
+      inbox: new FleetInbox(join(paths.fleetDir, 'inbox')), projects: listProjects,
+      extraRoutes: existingDocumentRoutes, migrate: migrateFleetOwnership, dispatch, reply, onError,
+      picker: createFleetPicker(channel),
+    });
+    const worker = new RelayWorker({ client, runtime, store, migrate: migrateFleetOwnership, onError });
+    const restore = installFleetHooks(channel, runtime, config.name, onError);
+    return {
+      handle: (kind: FleetEvent['kind'], data: unknown) => handle(kind, data, runtime),
+      stop: () => { worker.stop(); runtime.stop(); },
+      start: () => worker.start(),
+      shutdown: async () => {
+        worker.stop();
+        // Client close happens only after runtime shutdown/drain and offline publish.
+        await runtime.shutdown();
+        restore();
+        await client.close().catch(onError);
+        setFleetNodeId(undefined);
+      },
+    };
+  }
+
+  // The optional local proxy applies only to shared Bitable traffic, never to
+  // the ordinary bot channel or any other Codex/tool HTTP client.
+  const fleetClient = selectFleetApiClient(channel.rawClient, { appId: cfg.accounts.app.id, appSecret: secret,
+    tenant: cfg.accounts.app.tenant, apiProxyUrl: config.apiProxyUrl });
+  const store = new SignedFleetStore(new BitableFleetStorage(fleetClient, config), cfg.accounts.app.id, secret);
+  const runtime = new FleetRuntime({ config, cfg, host,
+    store, inbox: new FleetInbox(join(paths.fleetDir, 'inbox')), projects: listProjects, extraRoutes: existingDocumentRoutes,
+    migrate: migrateFleetOwnership, dispatch, reply, onError,
+    picker: createFleetPicker(channel),
+  });
+  const restore = installFleetHooks(channel, runtime, config.name, onError);
   return {
-    handle,
+    handle: (kind: FleetEvent['kind'], data: unknown) => handle(kind, data, runtime),
     stop: () => runtime.stop(),
     start: () => runtime.start(),
     shutdown: async () => { await runtime.shutdown(); restore(); setFleetNodeId(undefined); },

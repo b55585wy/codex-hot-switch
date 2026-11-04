@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
 import { createLarkChannel, Domain, type CardActionEvent, type CommentEvent,
-  type LarkChannel, type NormalizedMessage, type ReactionEvent } from '@larksuiteoapi/node-sdk';
+  type LarkChannel, type Logger, type NormalizedMessage, type ReactionEvent } from '@larksuiteoapi/node-sdk';
 import type { AppConfig } from '../../config/schema';
 import { SignedFleetStore, digest, eventActor, type FleetEvent, type FleetStorage } from '../model';
 import { FleetRuntime } from '../runtime';
@@ -38,6 +37,31 @@ export function relayGatewayIdentity(appId: string): { nodeId: string; host: str
   };
 }
 
+/** Static SDK diagnostics never echo raw logger arguments. */
+const SDK_LOG_ERROR = '飞书中继网关 SDK error 日志已脱敏（未包含原始参数）';
+/** Only public SDK error codes may be surfaced; everything else is discarded. */
+const SDK_ERROR_CODES = new Set([
+  'format_error', 'target_revoked', 'rate_limited', 'permission_denied',
+  'upload_failed', 'ssrf_blocked', 'send_timeout', 'not_connected', 'unknown',
+]);
+
+/**
+ * Only a bounded public error code may cross the SDK boundary. Raw messages,
+ * URLs, headers, request bodies and credentials are deliberately discarded.
+ */
+function sanitizedSdkError(error: unknown, label = '错误'): Error {
+  let code: string | undefined;
+  try {
+    if (error && typeof error === 'object') {
+      const candidate = (error as { code?: unknown }).code;
+      if (typeof candidate === 'string' && SDK_ERROR_CODES.has(candidate)) code = candidate;
+    }
+  } catch { /* hostile getters are treated as an unknown code */ }
+  const safe = new Error(`飞书中继网关 SDK ${label}${code ? `（${code}）` : ''}`);
+  safe.name = 'RelayGatewaySdkError';
+  return safe;
+}
+
 /**
  * Cloud Feishu receiver. It forwards the seven native event shapes into the
  * durable relay directory and never imports or invokes a model/backend/task.
@@ -47,8 +71,31 @@ export async function startFleetRelayGateway(options: FleetRelayGatewayOptions):
   if (options.tenant !== 'feishu' && options.tenant !== 'lark') throw new Error('中继网关租户配置无效');
   const identity = relayGatewayIdentity(options.appId);
   const onError = options.onError ?? (() => undefined);
+  // User callbacks must never break the SDK/receiver lifecycle.
+  const report = (error: unknown): void => {
+    try { onError(error); } catch { /* best effort */ }
+  };
+  const emitState = (state: GatewayState): void => {
+    try { options.onState?.(state); } catch (error) { report(error); }
+  };
+  let active = true;   // callbacks may publish state until teardown starts
+  let running = false; // only a successfully started gateway reacts to reconnects
   const setState = (state: GatewayState): void => {
-    try { options.onState?.(state); } catch (error) { onError(error); }
+    if (!active) return;
+    emitState(state);
+  };
+  // The SDK's default logger can print credential-bearing request objects.
+  // This logger ignores every argument and only emits bounded static text.
+  const sdkLogger: Logger = {
+    error: () => {
+      const safe = new Error(SDK_LOG_ERROR);
+      safe.name = 'RelayGatewaySdkError';
+      report(safe);
+    },
+    warn: () => undefined,
+    info: () => undefined,
+    debug: () => undefined,
+    trace: () => undefined,
   };
   let ownedChannel = false;
   let channel = options.channel;
@@ -62,9 +109,22 @@ export async function startFleetRelayGateway(options: FleetRelayGatewayOptions):
       policy: { requireMention: false },
       safety: { batch: { text: { delayMs: 0 } } },
       handshakeTimeoutMs: 30_000,
+      logger: sdkLogger,
     });
     ownedChannel = true;
   }
+  let ownedWsClosed = false;
+  // Owned transports are closed explicitly: the SDK only sets `connected`
+  // after a successful handshake, so a failed `connect()` can leave an
+  // auto-reconnecting WSClient alive even though `disconnect()` no-ops.
+  const closeOwnedChannel = async (): Promise<void> => {
+    if (!ownedChannel || !channel) return;
+    if (!ownedWsClosed) {
+      ownedWsClosed = true;
+      try { channel.rawWsClient?.close({}); } catch (error) { report(sanitizedSdkError(error)); }
+    }
+    try { await channel.disconnect(); } catch (error) { report(sanitizedSdkError(error)); }
+  };
 
   const config = {
     enabled: true,
@@ -100,7 +160,7 @@ export async function startFleetRelayGateway(options: FleetRelayGatewayOptions):
     inbox: { claim: async () => false, finish: async () => undefined } as never,
     projects: async () => [], migrate: async () => {},
     dispatch: async () => { throw new Error('中继网关不执行任务'); },
-    reply, picker: createFleetPicker(channel), onError, kind: 'gateway',
+    reply, picker: createFleetPicker(channel), onError: report, kind: 'gateway',
   });
 
   const teardown: Array<() => void> = [];
@@ -108,10 +168,10 @@ export async function startFleetRelayGateway(options: FleetRelayGatewayOptions):
     const event: FleetEvent = { kind, data: data as Record<string, unknown> };
     // Acknowledge Feishu immediately; durable relay work happens asynchronously.
     void runtime.receive(event).catch(async error => {
-      onError(error);
+      report(error);
       // Never echo raw storage/SDK errors (which may contain paths or
       // credentials) back into chat.
-      await reply(event, '中继请求处理失败，未执行。请稍后重试或联系管理员。').catch(onError);
+      await reply(event, '中继请求处理失败，未执行。请稍后重试或联系管理员。').catch(report);
     });
   };
 
@@ -161,28 +221,49 @@ export async function startFleetRelayGateway(options: FleetRelayGatewayOptions):
       });
       if (typeof registered === 'function') teardown.push(registered as () => void);
     }
+    // SDK lifecycle callbacks. Errors are reported as bounded static text;
+    // runtime transport/API errors never force a false permanent `error`
+    // state (only a failed startup does that).
+    teardown.push(channel.on('error', error => {
+      if (active) report(sanitizedSdkError(error));
+    }));
+    teardown.push(channel.on('reconnecting', () => {
+      if (running) setState('connecting');
+    }));
+    teardown.push(channel.on('reconnected', () => {
+      if (running) setState('connected');
+    }));
     if (ownedChannel) await channel.connect();
+    running = true;
     setState('connected');
   } catch (error) {
     setState('error');
+    running = false;
     for (const restore of teardown.reverse()) { try { restore(); } catch { /* best effort */ } }
-    await runtime.shutdown().catch(() => undefined);
-    if (ownedChannel) await channel.disconnect().catch(() => undefined);
+    await runtime.shutdown().catch(report);
+    // Close an owned WSClient even when connect() never set connected, then
+    // run disconnect() so the SDK safety pipeline is disposed.
+    await closeOwnedChannel();
+    active = false;
     throw error;
   }
 
-  // Inbox-like no-op directory keeps the option shape explicit without touching disk.
-  void join(options.dataDir, 'gateway-inbox');
-  let closed = false;
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    runtime.stop();
-    for (const restore of teardown.reverse()) { try { restore(); } catch (error) { onError(error); } }
-    await runtime.shutdown().catch(onError);
-    if (ownedChannel) await channel!.disconnect().catch(onError);
-    setState('disabled');
-    // The server owns the relay storage; gateway shutdown never closes it.
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    // Invalidate callbacks before any await: nothing may revive state or
+    // reconnect intake after shutdown starts.
+    running = false;
+    active = false;
+    closePromise = (async (): Promise<void> => {
+      runtime.stop();
+      for (const restore of teardown.reverse()) { try { restore(); } catch (error) { report(error); } }
+      await runtime.shutdown().catch(report);
+      await closeOwnedChannel();
+      emitState('disabled');
+      // The server owns the relay storage; gateway shutdown never closes it.
+    })();
+    return closePromise;
   };
   return { nodeId: identity.nodeId, close, shutdown: close };
 }

@@ -9,7 +9,10 @@ import { runWeb } from './commands/web';
 import { runDaemonControl } from './commands/daemon-control';
 import { runWinRelaunch } from '../service/win-startup';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
-import { runFleetSetup, runFleetStatus, runFleetDisable } from './commands/fleet';
+import {
+  runFleetSetup, runFleetStatus, runFleetDisable,
+  runFleetRelaySetupCommand, runFleetRelayStatusCommand, runFleetRelayDisable,
+} from './commands/fleet';
 
 const program = new Command();
 
@@ -135,7 +138,31 @@ fleet.command('setup').description('配置同一机器人和共享表，注册�
   .option('--poll-ms <ms>', '轮询间隔 5000–60000 毫秒，默认 15000')
   .action(runFleetSetup);
 fleet.command('status').description('查看本机多电脑配置，不输出密钥').action(runFleetStatus);
-fleet.command('disable').description('停用本机多电脑配置；需先停止后台').action(runFleetDisable);
+fleet.command('disable').description('停用本机多电脑配置；中继模式将失败关闭，不回退长连接').action(runFleetDisable);
+
+const relay = fleet.command('relay').description('可选云端实时中继（API-only worker；令牌只写入本机加密密钥库）');
+relay.command('setup')
+  .description('配置中继 worker；复用本机已有机器人凭据，不创建第二个机器人')
+  .requiredOption('--url <wss-url>', '中继 WebSocket URL（固定 /relay/v1；公网必须 wss://）')
+  .option('--name <name>', '电脑显示名称（默认沿用现有名称或主机名）')
+  .option('--app-id <id>', '指定已配置的机器人 App ID')
+  .requiredOption('--token-stdin', '从标准输入读取中继令牌（绝不出现在命令参数中）')
+  .option('--proxy-url <local-proxy>', '仅用于中继 WebSocket 的本地 HTTP(S) 代理')
+  .option('--import-from-bitable', '显式导入原 Bitable 目录的 nodes/routes（不复制指令/收件箱）')
+  .action(async (options: Parameters<typeof runFleetRelaySetupCommand>[0]) => {
+    await runFleetRelaySetupCommand(options);
+  });
+relay.command('status')
+  .description('只读显示中继 transport/URL/名称/设备 ID，不输出令牌或密钥引用')
+  .option('--app-id <id>', '指定已配置的机器人 App ID')
+  .action(async (options: { appId?: string }) => {
+    await runFleetRelayStatusCommand(options.appId);
+  });
+relay.command('disable')
+  .description('停用中继配置；后续 start 失败关闭，不回退到本机飞书长连接')
+  .action(async () => {
+    await runFleetRelayDisable();
+  });
 
 program
   .command('doctor')

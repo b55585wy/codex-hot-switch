@@ -51,11 +51,22 @@ export interface BridgeHandle {
  */
 export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   const app = opts.cfg.accounts.app;
+  const fleetConfig = opts.cfg.fleet;
+  // A disabled relay identity must fail closed. Falling back to a local Feishu
+  // WS here could race the cloud gateway for the same bot events.
+  if (fleetConfig?.transport === 'relay' && !fleetConfig.enabled) {
+    throw new Error('中继模式已停用，拒绝回退到本机飞书长连接；请先停用云端网关，再明确恢复原 Bitable/本机模式');
+  }
+  const relayWorker = Boolean(fleetConfig?.enabled && fleetConfig.transport === 'relay');
   const channel = createLarkChannel({
     appId: app.id,
     appSecret: opts.appSecret,
     domain: app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
     source: 'feishu-codex-bridge',
+    // Relay workers are API-only senders. The SDK's webhook lifecycle fetches
+    // bot identity and registers handlers without constructing a WSClient, so
+    // no Feishu event socket is opened at all.
+    ...(relayWorker ? { transport: 'webhook' as const } : {}),
     // surface raw events so card-action handlers can read form submissions
     // (action.form_value) — used by the new-project form.
     includeRawEvent: true,

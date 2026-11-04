@@ -428,3 +428,55 @@ describe('relay runtime hooks', () => {
     expect(onError).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('relay startup readiness and lifecycle idempotence', () => {
+  it('runs the readiness callback after publish/sync and before the first drain', async () => {
+    const ctx = await context({ nodeId: workerA });
+    const now = Date.now();
+    await ctx.store.put('routes', 'home', { nodeId: workerA });
+    await ctx.store.put('nodes', workerB, { id: workerB, name: 'gateway', protocol: FLEET_PROTOCOL,
+      seenAt: now, host: 'b', kind: 'gateway' });
+    const command = makeCommand('om_before_callback', workerA);
+    await ctx.store.put('commands', command.id, command, workerA, command.expiresAt);
+    const order: string[] = [];
+    await ctx.runtime.start(async () => {
+      order.push('callback');
+      // Ownership row must already be published, and no command may have run.
+      expect((await ctx.store.get<FleetNode>('nodes', workerA))?.host).toBe('host');
+      expect(ctx.dispatch).not.toHaveBeenCalled();
+    });
+    order.push('started');
+    await vi.waitFor(() => expect(ctx.dispatch).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(['callback', 'started']);
+  });
+
+  it('shares one startup chain for concurrent/repeat start and retains the callback for reconnect', async () => {
+    const ctx = await context({ nodeId: workerA });
+    await ctx.store.put('routes', 'home', { nodeId: workerA });
+    const readiness = vi.fn(async () => undefined);
+    await Promise.all([ctx.runtime.start(readiness), ctx.runtime.start(readiness)]);
+    expect(readiness).toHaveBeenCalledTimes(1);
+    await ctx.runtime.start(readiness);
+    expect(readiness).toHaveBeenCalledTimes(1);
+    // Reconnect runs publish/sync -> retained callback -> wake.
+    ctx.storage.notify({ type: 'reconnected' });
+    await vi.waitFor(() => expect(readiness).toHaveBeenCalledTimes(2));
+  });
+
+  it('cleans a failed partial startup and permits a clean retry', async () => {
+    let fail = true;
+    const migrate = vi.fn(async () => { if (fail) throw new Error('migrate failed'); });
+    const ctx = await context({ nodeId: workerA, migrate });
+    await ctx.store.put('routes', 'home', { nodeId: workerA });
+    await expect(ctx.runtime.start(async () => undefined)).rejects.toThrow('migrate failed');
+    expect(ctx.storage.listeners.size).toBe(0);
+    const internals = ctx.runtime as unknown as { timer?: unknown; heartbeatTimer?: unknown };
+    expect(internals.timer).toBeUndefined();
+    expect(internals.heartbeatTimer).toBeUndefined();
+    fail = false;
+    await ctx.runtime.start(async () => undefined);
+    expect(migrate).toHaveBeenCalledTimes(2);
+    await expect(ctx.runtime.start(async () => undefined)).resolves.toBeUndefined();
+    expect(migrate).toHaveBeenCalledTimes(2);
+  });
+});

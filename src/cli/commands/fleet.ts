@@ -7,10 +7,13 @@ import { resolveAppSecret } from '../../config/secret-resolver';
 import { setSecret } from '../../config/keystore';
 import { validateAppCredentials } from '../../utils/feishu-auth';
 import { isServiceRunning } from '../../service/adapter';
+import { acquireSingleInstanceLock } from '../../core/single-instance';
 import { ensureFleetTables } from '../../fleet/bitable';
 import { BitableFleetStorage } from '../../fleet/bitable';
 import { SignedFleetStore, validateFleetApiProxyUrl, validateFleetConfig, type FleetConfig } from '../../fleet/model';
 import { createFleetApiClient } from '../../fleet/transport';
+import { runFleetRelaySetup, runFleetRelayStatus, type RelaySetupOptions } from '../../fleet/relay/setup';
+import { sanitizeRelayUrl } from '../../fleet/relay/client';
 
 export function parseBaseToken(input: string): string {
   if (/^[a-zA-Z0-9]{10,}$/.test(input)) return input;
@@ -102,15 +105,58 @@ export async function runFleetSetup(options: {
 
 export async function runFleetStatus(): Promise<void> {
   const cfg = await selectedConfig();
-  console.log(JSON.stringify(cfg.fleet ? { enabled: cfg.fleet.enabled, nodeId: cfg.fleet.nodeId,
-    name: cfg.fleet.name, pollMs: cfg.fleet.pollMs ?? 15_000, configFile: paths.configFile }
-    : { enabled: false, configFile: paths.configFile }, null, 2));
+  const fleet = cfg.fleet;
+  // Relay status is transport-oriented and must not show an irrelevant Bitable
+  // poll interval. The URL is sanitized to a fixed validated endpoint.
+  const view = fleet?.transport === 'relay'
+    ? { enabled: fleet.enabled, transport: 'relay' as const, nodeId: fleet.nodeId, name: fleet.name,
+      url: fleet.relay ? sanitizeRelayUrl(fleet.relay.url) : '(invalid relay url)',
+      configFile: paths.configFile }
+    : fleet
+      ? { enabled: fleet.enabled, transport: 'bitable' as const, nodeId: fleet.nodeId,
+        name: fleet.name, pollMs: fleet.pollMs ?? 15_000, configFile: paths.configFile }
+      : { enabled: false, transport: 'bitable' as const, configFile: paths.configFile };
+  console.log(JSON.stringify(view, null, 2));
 }
 
 export async function runFleetDisable(): Promise<void> {
-  if (isServiceRunning()) throw new Error('请先停止本机 Bridge，修改配置后再 start');
   const cfg = await selectedConfig();
+  if (cfg.fleet?.transport === 'relay') { await runFleetRelayDisable(); return; }
+  if (isServiceRunning()) throw new Error('请先停止本机 Bridge，修改配置后再 start');
   if (!isComplete(cfg)) throw new Error('机器人配置不完整');
   if (cfg.fleet) { cfg.fleet.enabled = false; await saveConfig(cfg); }
   console.log('多电脑配置已关闭。仅在其他节点也已停用后，才以原单机模式连接同一个机器人。');
+}
+
+export async function runFleetRelaySetupCommand(options: RelaySetupOptions): Promise<void> {
+  const result = await runFleetRelaySetup(options);
+  console.log(JSON.stringify(result, null, 2));
+  console.log('中继配置已启用。请先确认云端网关已准备好，再运行 start；本机不会连接飞书事件长连接。');
+}
+
+export async function runFleetRelayStatusCommand(appId?: string): Promise<void> {
+  console.log(JSON.stringify(await runFleetRelayStatus(appId), null, 2));
+}
+
+export async function runFleetRelayDisable(): Promise<void> {
+  const cfg = await selectedConfig();
+  // Refuse to touch a Bitable/no-fleet configuration: the general
+  // `fleet disable` command owns that transport.
+  if (!cfg.fleet) throw new Error('当前没有多电脑配置，未修改任何配置');
+  if (cfg.fleet.transport !== 'relay') {
+    throw new Error('当前为 Bitable/本机多电脑模式，拒绝按中继方式停用；请使用 fleet disable，未修改配置');
+  }
+  if (!isComplete(cfg)) throw new Error('机器人配置不完整');
+  const appId = cfg.accounts!.app!.id;
+  let release: (() => void) | undefined;
+  try {
+    release = acquireSingleInstanceLock(appId);
+    if (isServiceRunning()) throw new Error('请先停止本机 Bridge 后台服务，再修改中继配置');
+    cfg.fleet = { ...cfg.fleet, enabled: false };
+    await saveConfig(cfg as AppConfig);
+    console.log('中继模式已停用。后续 start 会失败关闭，不会回退到本机飞书长连接。');
+    console.log('回滚只有在云端网关已明确停用后才能进行；当前命令不会远程停用网关，也不会改回 Bitable。');
+  } finally {
+    release?.();
+  }
 }
