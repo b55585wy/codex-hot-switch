@@ -8,6 +8,7 @@ import { paths } from '../config/paths';
 import { listProjects } from '../project/registry';
 import { backfillGroupMenus } from '../project/group-menu';
 import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
+import { createFleetBridge } from '../fleet';
 
 /** True when `cwd` is a registered project's working dir (or a subdir of one) —
  *  drives the 'bound_projects' notify scope. Trailing slashes normalized so
@@ -84,18 +85,19 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     isBoundProject: cwdIsBoundProject,
   });
   const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
-  channel.on('message', orchestrator.onMessage);
-  channel.on('cardAction', orchestrator.dispatcher.handle);
+  const fleet = createFleetBridge(channel, opts.cfg, opts.appSecret, orchestrator);
+  channel.on('message', fleet ? event => fleet.handle('message', event) : orchestrator.onMessage);
+  channel.on('cardAction', fleet ? event => fleet.handle('cardAction', event) : orchestrator.dispatcher.handle);
   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
   // reply in the same comment thread.
-  channel.on('comment', orchestrator.onComment);
+  channel.on('comment', fleet ? event => fleet.handle('comment', event) : orchestrator.onComment);
   // A human added the bot to a group → DM the (admin) adder a bind card to
   // register it as a `joined` project.
-  channel.on('botAdded', orchestrator.onBotAddedToChat);
+  channel.on('botAdded', fleet ? event => fleet.handle('botAdded', event) : orchestrator.onBotAddedToChat);
   // Inbound reactions (im.message.reaction.created_v1, SDK-normalized + deduped):
   // 终态 run 卡 👍 = 续轮，运行中 run/排队卡 OK/DONE = ⏹ 终止（M-6）。Without the
   // im:message.reactions:read scope the event is simply never pushed — silent off.
-  channel.on('reaction', orchestrator.onReaction);
+  channel.on('reaction', fleet ? event => fleet.handle('reaction', event) : orchestrator.onReaction);
   // The SDK exposes no named event for bot-*removed* (im.chat.member.bot.deleted_v1)
   // nor for bot-menu clicks (application.bot.menu_v6), so tap its private raw
   // EventDispatcher: register() merges by event key, so this adds our handlers
@@ -113,7 +115,8 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
         'im.chat.member.bot.deleted_v1': (raw: unknown) => {
           const ev = raw as { chat_id?: string; event?: { chat_id?: string } };
           const chatId = ev?.chat_id ?? ev?.event?.chat_id;
-          if (chatId) void orchestrator.onBotRemovedFromChat(chatId);
+          if (chatId && fleet) fleet.handle('botRemoved', { chatId, openId: '__platform__' });
+          else if (chatId) void orchestrator.onBotRemovedFromChat(chatId);
         },
         // Bot-menu click → DM console menu card. The payload may carry fields at
         // the top level or under `event` depending on schema version — read both.
@@ -124,11 +127,13 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
             operator?: { operator_id?: { open_id?: string } };
             event?: { event_key?: string; operator?: { operator_id?: { open_id?: string } } };
           };
-          void orchestrator.onBotMenu({
+          const menu = {
             openId: ev?.operator?.operator_id?.open_id ?? ev?.event?.operator?.operator_id?.open_id,
             eventKey: ev?.event_key ?? ev?.event?.event_key,
             eventId: ev?.event_id,
-          });
+          };
+          if (fleet) fleet.handle('botMenu', menu);
+          else void orchestrator.onBotMenu(menu);
         },
       });
       log.info('ws', 'raw-event-tap', { events: ['im.chat.member.bot.deleted_v1', 'application.bot.menu_v6'] });
@@ -144,6 +149,10 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   channel.on('reconnected', () => log.info('ws', 'reconnected'));
 
   await channel.connect();
+  if (fleet) {
+    try { await fleet.start(); }
+    catch (error) { await fleet.shutdown(); await channel.disconnect(); throw error; }
+  }
   // Native group menus + persistent entry cards: one bounded, sequential repair
   // pass for existing Bridge-created projects. It starts only after the channel
   // is live and is cancelled by shutdown. Nonfatal by design (missing
@@ -164,8 +173,10 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     if (closed) return;
     closed = true;
     groupMenuAbort.abort();
+    fleet?.stop();
     await orchestrator.shutdown();
     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
+    await fleet?.shutdown();
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
   return { channel, adminExecute: orchestrator.adminExecute, shutdown };
